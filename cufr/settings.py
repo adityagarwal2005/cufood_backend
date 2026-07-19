@@ -25,7 +25,10 @@ environ.Env.read_env(BASE_DIR / ".env")
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = env("DJANGO_SECRET_KEY", default="django-insecure-w*_8-m@+nh)ggi$=#0vd6q-g@+on#&tuu&muoa#2%a58gn1e1g")
+# No default here on purpose: a missing DJANGO_SECRET_KEY should fail
+# loudly at startup rather than silently fall back to a key that's sitting
+# in source history.
+SECRET_KEY = env("DJANGO_SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env.bool("DJANGO_DEBUG", default=True)
@@ -144,6 +147,11 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
+    "DEFAULT_THROTTLE_RATES": {
+        # Applied to LoginView via throttle_scope = "login" — slows down
+        # brute-force password guessing without needing a new dependency.
+        "login": "5/min",
+    },
 }
 
 

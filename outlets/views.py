@@ -7,6 +7,7 @@ from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from .models import Location, MenuItem, Restaurant
@@ -110,6 +111,9 @@ class CSRFView(APIView):
 
 
 class LoginView(APIView):
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
     def post(self, request):
         username = request.data.get("username")
         password = request.data.get("password")
