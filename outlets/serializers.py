@@ -20,9 +20,9 @@ class RestaurantListSerializer(serializers.ModelSerializer):
 class PublicMenuItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = MenuItem
-        # Frontend contract: if price_half / price_full are non-null, show those
-        # instead of price (price is null on half/full items). Otherwise use price.
-        fields = ["name", "category", "price", "price_half", "price_full"]
+        # Frontend contract: price_tiers (if non-null) takes priority over
+        # price_half/price_full, which take priority over plain price.
+        fields = ["name", "category", "price", "price_half", "price_full", "price_tiers"]
 
 
 class RestaurantDetailSerializer(serializers.ModelSerializer):
@@ -60,6 +60,7 @@ class OwnerMenuItemSerializer(serializers.ModelSerializer):
             "price",
             "price_half",
             "price_full",
+            "price_tiers",
             "is_permanently_active",
             "is_available_today",
         ]

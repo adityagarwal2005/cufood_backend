@@ -51,6 +51,10 @@ class MenuItem(models.Model):
     price = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
     price_half = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
     price_full = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    # For items sold in more than two sizes (e.g. pizza Regular/Medium/Large/Giant).
+    # Ordered mapping of size label -> price, e.g. {"Regular": 99, "Medium": 179}.
+    # Takes priority over price/price_half/price_full when present.
+    price_tiers = models.JSONField(null=True, blank=True)
     is_permanently_active = models.BooleanField(default=True)
     is_available_today = models.BooleanField(default=True)
 
