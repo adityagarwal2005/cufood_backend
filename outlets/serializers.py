@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Location, MenuItem, Restaurant
+from .models import Location, MenuItem, Order, OrderItem, Restaurant
 
 
 class LocationSerializer(serializers.ModelSerializer):
@@ -22,7 +22,8 @@ class PublicMenuItemSerializer(serializers.ModelSerializer):
         model = MenuItem
         # Frontend contract: price_tiers (if non-null) takes priority over
         # price_half/price_full, which take priority over plain price.
-        fields = ["name", "category", "price", "price_half", "price_full", "price_tiers"]
+        # "id" is required so the cart can reference which item was added.
+        fields = ["id", "name", "category", "price", "price_half", "price_full", "price_tiers"]
 
 
 class RestaurantDetailSerializer(serializers.ModelSerializer):
@@ -79,3 +80,37 @@ class MenuItemCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = MenuItem
         fields = ["id", "name", "category", "price"]
+
+
+class OrderItemSerializer(serializers.ModelSerializer):
+    subtotal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = ["name", "size_label", "unit_price", "quantity", "subtotal"]
+
+    def get_subtotal(self, item):
+        return item.unit_price * item.quantity
+
+
+class OrderSerializer(serializers.ModelSerializer):
+    restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
+    restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
+    items = OrderItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Order
+        fields = [
+            "order_code",
+            "restaurant_name",
+            "restaurant_slug",
+            "student_name",
+            "student_uid",
+            "status",
+            "payment_status",
+            "total_amount",
+            "estimated_ready_minutes",
+            "estimated_ready_at",
+            "created_at",
+            "items",
+        ]

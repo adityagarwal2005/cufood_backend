@@ -1,3 +1,5 @@
+import razorpay
+from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -10,15 +12,47 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from .models import Location, MenuItem, Restaurant
+from .models import Location, MenuItem, Order, OrderItem, Restaurant
 from .serializers import (
     LocationSerializer,
     MenuItemCreateSerializer,
+    OrderSerializer,
     OwnerMenuItemSerializer,
     OwnerRestaurantSerializer,
     RestaurantDetailSerializer,
     RestaurantListSerializer,
 )
+
+
+def get_razorpay_client():
+    """Returns a configured Razorpay client, or None if keys aren't set yet."""
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        return None
+    return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
+
+def resolve_item_price(menu_item, size_label):
+    """Returns (unit_price, error_message). error_message is None on success.
+    Mirrors the frontend's price display contract: price_tiers takes
+    priority over price_half/price_full, which takes priority over price."""
+    size_label = (size_label or "").strip()
+
+    if menu_item.price_tiers:
+        if size_label not in menu_item.price_tiers:
+            valid = ", ".join(menu_item.price_tiers.keys())
+            return None, f"'{menu_item.name}' needs a size: {valid}."
+        return menu_item.price_tiers[size_label], None
+
+    if menu_item.price_half is not None or menu_item.price_full is not None:
+        if size_label == "Half" and menu_item.price_half is not None:
+            return menu_item.price_half, None
+        if size_label == "Full" and menu_item.price_full is not None:
+            return menu_item.price_full, None
+        return None, f"'{menu_item.name}' needs a size: Half, Full."
+
+    if menu_item.price is None:
+        return None, f"'{menu_item.name}' doesn't have a price set yet."
+    return menu_item.price, None
 
 
 def get_owned_restaurant(user):
@@ -205,3 +239,194 @@ class MenuItemDeleteView(APIView):
         item = get_object_or_404(MenuItem, id=item_id, restaurant=restaurant)
         item.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+MAX_ITEM_QUANTITY = 20
+
+
+class CreatePaymentView(APIView):
+    """Validates a student's cart server-side (never trust client-sent
+    prices), creates our Order + OrderItems in payment_pending state, and
+    opens a matching Razorpay order for the frontend Checkout modal."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def post(self, request):
+        restaurant_slug = request.data.get("restaurant_slug")
+        student_name = (request.data.get("student_name") or "").strip()
+        student_uid = (request.data.get("student_uid") or "").strip()
+        raw_items = request.data.get("items")
+
+        if not restaurant_slug:
+            return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not student_name:
+            return Response({"detail": "Your name is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not student_uid:
+            return Response({"detail": "Your UID is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not raw_items or not isinstance(raw_items, list):
+            return Response({"detail": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
+
+        restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
+        if not restaurant.is_open_today:
+            return Response(
+                {"detail": f"{restaurant.name} is closed today."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        pending_items = []
+        total_amount = 0
+        for raw_item in raw_items:
+            menu_item_id = raw_item.get("menu_item_id")
+            quantity = raw_item.get("quantity")
+            size_label = (raw_item.get("size_label") or "").strip()
+
+            if not isinstance(quantity, int) or not (1 <= quantity <= MAX_ITEM_QUANTITY):
+                return Response(
+                    {"detail": "Invalid quantity in cart."}, status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Filtering by restaurant=restaurant here is what enforces
+            # "single restaurant per order" at the data level, not just in
+            # the frontend UI: an item from any other restaurant 404s.
+            menu_item = MenuItem.objects.filter(id=menu_item_id, restaurant=restaurant).first()
+            if menu_item is None:
+                return Response(
+                    {"detail": "One of the items in your cart isn't on this restaurant's menu."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not menu_item.is_permanently_active or not menu_item.is_available_today:
+                return Response(
+                    {"detail": f"'{menu_item.name}' is no longer available."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            unit_price, error = resolve_item_price(menu_item, size_label)
+            if error:
+                return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+
+            total_amount += unit_price * quantity
+            pending_items.append(
+                OrderItem(
+                    menu_item=menu_item,
+                    name=menu_item.name,
+                    size_label=size_label,
+                    unit_price=unit_price,
+                    quantity=quantity,
+                )
+            )
+
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            razorpay_order = client.order.create(
+                {
+                    "amount": int(total_amount * 100),  # paise
+                    "currency": "INR",
+                    "payment_capture": 1,
+                }
+            )
+        except Exception:
+            return Response(
+                {"detail": "Could not start payment. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        order = Order.objects.create(
+            restaurant=restaurant,
+            student_name=student_name,
+            student_uid=student_uid,
+            total_amount=total_amount,
+            razorpay_order_id=razorpay_order["id"],
+        )
+        for item in pending_items:
+            item.order = order
+        OrderItem.objects.bulk_create(pending_items)
+
+        return Response(
+            {
+                "razorpay_order_id": razorpay_order["id"],
+                "razorpay_key_id": settings.RAZORPAY_KEY_ID,
+                "amount": razorpay_order["amount"],
+                "currency": razorpay_order["currency"],
+                "restaurant_name": restaurant.name,
+                "order_code": order.order_code,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class VerifyPaymentView(APIView):
+    """Called by the frontend after Razorpay Checkout succeeds. Verifies the
+    HMAC signature server-side before trusting the payment — this is the
+    step that actually confirms money moved, not just that the Checkout
+    modal closed without an error."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def post(self, request):
+        razorpay_order_id = request.data.get("razorpay_order_id")
+        razorpay_payment_id = request.data.get("razorpay_payment_id")
+        razorpay_signature = request.data.get("razorpay_signature")
+
+        if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature]):
+            return Response(
+                {"detail": "Missing payment verification fields."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        order = Order.objects.filter(
+            razorpay_order_id=razorpay_order_id, status=Order.STATUS_PAYMENT_PENDING
+        ).first()
+        if order is None:
+            return Response(
+                {"detail": "Order not found or already processed."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            client.utility.verify_payment_signature(
+                {
+                    "razorpay_order_id": razorpay_order_id,
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "razorpay_signature": razorpay_signature,
+                }
+            )
+        except razorpay.errors.SignatureVerificationError:
+            order.payment_status = Order.PAYMENT_FAILED
+            order.save(update_fields=["payment_status", "updated_at"])
+            return Response(
+                {"detail": "Payment verification failed."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        order.payment_status = Order.PAYMENT_PAID
+        order.status = Order.STATUS_PLACED
+        order.razorpay_payment_id = razorpay_payment_id
+        order.save(update_fields=["payment_status", "status", "razorpay_payment_id", "updated_at"])
+
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
+
+
+class OrderStatusView(APIView):
+    """Public lookup for a student checking their own order — no login,
+    just the 6-char pickup code. Throttled to make brute-force
+    enumeration of other students' order codes impractical."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def get(self, request, order_code):
+        order = get_object_or_404(Order, order_code=order_code.upper())
+        return Response(OrderSerializer(order).data)

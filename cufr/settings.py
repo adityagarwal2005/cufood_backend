@@ -151,6 +151,9 @@ REST_FRAMEWORK = {
         # Applied to LoginView via throttle_scope = "login" — slows down
         # brute-force password guessing without needing a new dependency.
         "login": "5/min",
+        # Applied to order create/verify/lookup — keeps genuine ordering
+        # snappy while making order-code enumeration impractical.
+        "orders": "30/min",
     },
 }
 
@@ -183,6 +186,13 @@ CSRF_TRUSTED_ORIGINS = env.list(
 )
 if RENDER_EXTERNAL_HOSTNAME:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
+
+
+# Razorpay (student order payments). Left blank until you create a Razorpay
+# account and add real test/live keys as env vars — payment endpoints return
+# a clear 503 instead of crashing the app when these are unset.
+RAZORPAY_KEY_ID = env("RAZORPAY_KEY_ID", default="")
+RAZORPAY_KEY_SECRET = env("RAZORPAY_KEY_SECRET", default="")
 
 
 # Production hardening (only applies when DEBUG=False, i.e. on Render)
