@@ -60,6 +60,22 @@ def get_owned_restaurant(user):
     return Restaurant.objects.filter(owner=user).first()
 
 
+def get_order_for_owner(user, order_code):
+    """Return (order, error_response). error_response is None on success.
+    Scopes the lookup to the caller's own restaurant so one owner can
+    never see or act on another restaurant's orders."""
+    restaurant = get_owned_restaurant(user)
+    if restaurant is None:
+        return None, Response(
+            {"detail": "No restaurant linked to this account"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    order = Order.objects.filter(order_code=order_code.upper(), restaurant=restaurant).first()
+    if order is None:
+        return None, Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+    return order, None
+
+
 def get_valid_location_or_error(request):
     """Return (location_slug, None) or (None, error_response) for the
     required ?location= query param."""
@@ -429,4 +445,117 @@ class OrderStatusView(APIView):
 
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
+        return Response(OrderSerializer(order).data)
+
+
+class MyOrdersView(APIView):
+    """Owner's order queue. Placed orders need a decision; accepted/ready
+    ones are being tracked; everything else is recent history."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        restaurant = get_owned_restaurant(request.user)
+        if restaurant is None:
+            return Response(
+                {"detail": "No restaurant linked to this account"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        orders = Order.objects.filter(restaurant=restaurant).exclude(
+            status=Order.STATUS_PAYMENT_PENDING
+        ).order_by("-created_at")[:100]
+        return Response(OrderSerializer(orders, many=True).data)
+
+
+class AcceptOrderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, order_code):
+        order, error = get_order_for_owner(request.user, order_code)
+        if error is not None:
+            return error
+        if order.status != Order.STATUS_PLACED:
+            return Response(
+                {"detail": f"Order is '{order.status}', not awaiting a decision."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.mark_accepted()
+        return Response(OrderSerializer(order).data)
+
+
+class RejectOrderView(APIView):
+    """Rejecting a paid order refunds it in full via Razorpay. If the
+    refund call itself fails, the order is left untouched (still
+    'placed') rather than being marked rejected/refunded when no money
+    actually moved — the owner can retry."""
+
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, order_code):
+        order, error = get_order_for_owner(request.user, order_code)
+        if error is not None:
+            return error
+        if order.status != Order.STATUS_PLACED:
+            return Response(
+                {"detail": f"Order is '{order.status}', not awaiting a decision."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            refund = client.payment.refund(
+                order.razorpay_payment_id, {"amount": int(order.total_amount * 100)}
+            )
+        except Exception:
+            return Response(
+                {"detail": "Could not process the refund. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        order.status = Order.STATUS_REJECTED
+        order.payment_status = Order.PAYMENT_REFUNDED
+        order.razorpay_refund_id = refund["id"]
+        order.save(
+            update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"]
+        )
+        return Response(OrderSerializer(order).data)
+
+
+class MarkOrderReadyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, order_code):
+        order, error = get_order_for_owner(request.user, order_code)
+        if error is not None:
+            return error
+        if order.status != Order.STATUS_ACCEPTED:
+            return Response(
+                {"detail": f"Order is '{order.status}', not being prepared."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.status = Order.STATUS_READY
+        order.save(update_fields=["status", "updated_at"])
+        return Response(OrderSerializer(order).data)
+
+
+class CompleteOrderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, order_code):
+        order, error = get_order_for_owner(request.user, order_code)
+        if error is not None:
+            return error
+        if order.status != Order.STATUS_READY:
+            return Response(
+                {"detail": f"Order is '{order.status}', not ready for pickup."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.status = Order.STATUS_COMPLETED
+        order.save(update_fields=["status", "updated_at"])
         return Response(OrderSerializer(order).data)

@@ -21,4 +21,9 @@ urlpatterns = [
     path("orders/create-payment/", views.CreatePaymentView.as_view()),
     path("orders/verify-payment/", views.VerifyPaymentView.as_view()),
     path("orders/<str:order_code>/", views.OrderStatusView.as_view()),
+    path("me/orders/", views.MyOrdersView.as_view()),
+    path("me/orders/<str:order_code>/accept/", views.AcceptOrderView.as_view()),
+    path("me/orders/<str:order_code>/reject/", views.RejectOrderView.as_view()),
+    path("me/orders/<str:order_code>/ready/", views.MarkOrderReadyView.as_view()),
+    path("me/orders/<str:order_code>/complete/", views.CompleteOrderView.as_view()),
 ]
