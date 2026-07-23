@@ -6,6 +6,7 @@ from django.utils.text import slugify
 class Location(models.Model):
     name = models.CharField(max_length=100)
     slug = models.SlugField(max_length=120, unique=True, blank=True)
+    photo = models.URLField(blank=True)
 
     def save(self, *args, **kwargs):
         if not self.slug:

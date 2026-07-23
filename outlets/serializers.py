@@ -6,7 +6,7 @@ from .models import Location, MenuItem, Restaurant
 class LocationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Location
-        fields = ["name", "slug"]
+        fields = ["name", "slug", "photo"]
 
 
 class RestaurantListSerializer(serializers.ModelSerializer):
