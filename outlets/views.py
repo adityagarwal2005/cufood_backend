@@ -1,7 +1,8 @@
+import razorpay
+from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework import status
@@ -21,6 +22,13 @@ from .serializers import (
     RestaurantDetailSerializer,
     RestaurantListSerializer,
 )
+
+
+def get_razorpay_client():
+    """Returns a configured Razorpay client, or None if keys aren't set yet."""
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        return None
+    return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
 
 def resolve_item_price(menu_item, size_label):
@@ -202,31 +210,6 @@ class ToggleRestaurantOpenView(APIView):
         return Response(OwnerRestaurantSerializer(restaurant).data)
 
 
-class UpdateUpiIdView(APIView):
-    """Lets an owner set the UPI ID students pay once their order is
-    accepted. No format validation beyond "looks like a VPA" — restaurants
-    know their own UPI ID better than a regex would."""
-
-    permission_classes = [IsAuthenticated]
-
-    def patch(self, request):
-        restaurant = get_owned_restaurant(request.user)
-        if restaurant is None:
-            return Response(
-                {"detail": "No restaurant linked to this account"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        upi_id = (request.data.get("upi_id") or "").strip()
-        if upi_id and "@" not in upi_id:
-            return Response(
-                {"detail": "That doesn't look like a UPI ID (should look like name@bank)."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        restaurant.upi_id = upi_id
-        restaurant.save(update_fields=["upi_id"])
-        return Response(OwnerRestaurantSerializer(restaurant).data)
-
-
 class ToggleMenuItemTodayView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -277,10 +260,10 @@ class MenuItemDeleteView(APIView):
 MAX_ITEM_QUANTITY = 20
 
 
-class CreateOrderView(APIView):
+class CreatePaymentView(APIView):
     """Validates a student's cart server-side (never trust client-sent
-    prices) and creates the Order + OrderItems in 'placed' state. No payment
-    happens here — that only occurs after the restaurant accepts."""
+    prices), creates our Order + OrderItems in payment_pending state, and
+    opens a matching Razorpay order for the frontend Checkout modal."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
@@ -348,58 +331,108 @@ class CreateOrderView(APIView):
                 )
             )
 
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            razorpay_order = client.order.create(
+                {
+                    "amount": int(total_amount * 100),  # paise
+                    "currency": "INR",
+                    "payment_capture": 1,
+                }
+            )
+        except Exception:
+            return Response(
+                {"detail": "Could not start payment. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
         order = Order.objects.create(
             restaurant=restaurant,
             student_name=student_name,
             student_uid=student_uid,
             total_amount=total_amount,
+            razorpay_order_id=razorpay_order["id"],
         )
         for item in pending_items:
             item.order = order
         OrderItem.objects.bulk_create(pending_items)
 
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        return Response(
+            {
+                "razorpay_order_id": razorpay_order["id"],
+                "razorpay_key_id": settings.RAZORPAY_KEY_ID,
+                "amount": razorpay_order["amount"],
+                "currency": razorpay_order["currency"],
+                "restaurant_name": restaurant.name,
+                "order_code": order.order_code,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
-class ClaimPaymentView(APIView):
-    """Public — a student taps 'I've paid' on the order-status page after
-    sending money to the restaurant's UPI ID. This is a self-report, not
-    proof; the restaurant still checks their own UPI app before confirming
-    (see ConfirmPaymentView)."""
+class VerifyPaymentView(APIView):
+    """Called by the frontend after Razorpay Checkout succeeds. Verifies the
+    HMAC signature server-side before trusting the payment — this is the
+    step that actually confirms money moved, not just that the Checkout
+    modal closed without an error."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
-    def patch(self, request, order_code):
-        order = get_object_or_404(Order, order_code=order_code.upper())
-        if order.status != Order.STATUS_ACCEPTED:
+    def post(self, request):
+        razorpay_order_id = request.data.get("razorpay_order_id")
+        razorpay_payment_id = request.data.get("razorpay_payment_id")
+        razorpay_signature = request.data.get("razorpay_signature")
+
+        if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature]):
             return Response(
-                {"detail": f"Order is '{order.status}', not awaiting payment."},
+                {"detail": "Missing payment verification fields."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        order.payment_status = Order.PAYMENT_CLAIMED
-        order.payment_claimed_at = timezone.now()
-        order.save(update_fields=["payment_status", "payment_claimed_at", "updated_at"])
-        return Response(OrderSerializer(order).data)
 
-
-class ConfirmPaymentView(APIView):
-    """Owner confirms they've actually seen the money land in their own UPI
-    app, and starts preparing the order."""
-
-    permission_classes = [IsAuthenticated]
-
-    def patch(self, request, order_code):
-        order, error = get_order_for_owner(request.user, order_code)
-        if error is not None:
-            return error
-        if order.status != Order.STATUS_ACCEPTED:
+        order = Order.objects.filter(
+            razorpay_order_id=razorpay_order_id, status=Order.STATUS_PAYMENT_PENDING
+        ).first()
+        if order is None:
             return Response(
-                {"detail": f"Order is '{order.status}', not awaiting payment confirmation."},
-                status=status.HTTP_400_BAD_REQUEST,
+                {"detail": "Order not found or already processed."},
+                status=status.HTTP_404_NOT_FOUND,
             )
-        order.mark_preparing()
-        return Response(OrderSerializer(order).data)
+
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            client.utility.verify_payment_signature(
+                {
+                    "razorpay_order_id": razorpay_order_id,
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "razorpay_signature": razorpay_signature,
+                }
+            )
+        except razorpay.errors.SignatureVerificationError:
+            order.payment_status = Order.PAYMENT_FAILED
+            order.save(update_fields=["payment_status", "updated_at"])
+            return Response(
+                {"detail": "Payment verification failed."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        order.payment_status = Order.PAYMENT_PAID
+        order.status = Order.STATUS_PLACED
+        order.razorpay_payment_id = razorpay_payment_id
+        order.save(update_fields=["payment_status", "status", "razorpay_payment_id", "updated_at"])
+
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
 
 class OrderStatusView(APIView):
@@ -428,14 +461,13 @@ class MyOrdersView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        orders = Order.objects.filter(restaurant=restaurant).order_by("-created_at")[:100]
+        orders = Order.objects.filter(restaurant=restaurant).exclude(
+            status=Order.STATUS_PAYMENT_PENDING
+        ).order_by("-created_at")[:100]
         return Response(OrderSerializer(orders, many=True).data)
 
 
 class AcceptOrderView(APIView):
-    """Accepting just says 'yes, we can make this' — the student is shown
-    the restaurant's UPI ID to pay next. No money has moved yet."""
-
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, order_code):
@@ -447,14 +479,15 @@ class AcceptOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        order.status = Order.STATUS_ACCEPTED
-        order.save(update_fields=["status", "updated_at"])
+        order.mark_accepted()
         return Response(OrderSerializer(order).data)
 
 
 class RejectOrderView(APIView):
-    """No payment has happened at this point, so rejecting is just a status
-    change — nothing to refund."""
+    """Rejecting a paid order refunds it in full via Razorpay. If the
+    refund call itself fails, the order is left untouched (still
+    'placed') rather than being marked rejected/refunded when no money
+    actually moved — the owner can retry."""
 
     permission_classes = [IsAuthenticated]
 
@@ -467,8 +500,30 @@ class RejectOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        client = get_razorpay_client()
+        if client is None:
+            return Response(
+                {"detail": "Online payments aren't set up yet."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            refund = client.payment.refund(
+                order.razorpay_payment_id, {"amount": int(order.total_amount * 100)}
+            )
+        except Exception:
+            return Response(
+                {"detail": "Could not process the refund. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
         order.status = Order.STATUS_REJECTED
-        order.save(update_fields=["status", "updated_at"])
+        order.payment_status = Order.PAYMENT_REFUNDED
+        order.razorpay_refund_id = refund["id"]
+        order.save(
+            update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"]
+        )
         return Response(OrderSerializer(order).data)
 
 
@@ -479,7 +534,7 @@ class MarkOrderReadyView(APIView):
         order, error = get_order_for_owner(request.user, order_code)
         if error is not None:
             return error
-        if order.status != Order.STATUS_PREPARING:
+        if order.status != Order.STATUS_ACCEPTED:
             return Response(
                 {"detail": f"Order is '{order.status}', not being prepared."},
                 status=status.HTTP_400_BAD_REQUEST,

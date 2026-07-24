@@ -7,3 +7,4 @@ psycopg2-binary==2.9.12
 sqlparse==0.5.5
 gunicorn==23.0.0
 whitenoise==6.11.0
+razorpay==2.0.1

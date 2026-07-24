@@ -11,7 +11,7 @@ class LocationAdmin(admin.ModelAdmin):
 
 @admin.register(Restaurant)
 class RestaurantAdmin(admin.ModelAdmin):
-    list_display = ("name", "slug", "location", "is_open_today", "upi_id", "owner")
+    list_display = ("name", "slug", "location", "is_open_today", "owner")
     list_filter = ("location", "is_open_today")
     fields = (
         "name",
@@ -19,7 +19,6 @@ class RestaurantAdmin(admin.ModelAdmin):
         "photo",
         "location",
         "contact_number",
-        "upi_id",
         "is_open_today",
         "owner",
     )
@@ -58,10 +57,11 @@ class OrderAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("restaurant", "status", "payment_status")
-    search_fields = ("order_code", "student_name", "student_uid")
+    search_fields = ("order_code", "student_name", "student_uid", "razorpay_payment_id")
     readonly_fields = (
-        "payment_claimed_at",
-        "payment_confirmed_at",
+        "razorpay_order_id",
+        "razorpay_payment_id",
+        "razorpay_refund_id",
         "created_at",
         "updated_at",
     )
