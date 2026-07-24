@@ -39,6 +39,9 @@ class Restaurant(models.Model):
         Location, on_delete=models.PROTECT, related_name="restaurants"
     )
     contact_number = models.CharField(max_length=20, blank=True)
+    # Shown to a student once their order is accepted, so they can pay the
+    # restaurant directly (no payment gateway — see Order status machine).
+    upi_id = models.CharField(max_length=100, blank=True)
     owner = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -77,30 +80,32 @@ class MenuItem(models.Model):
 
 
 class Order(models.Model):
-    STATUS_PAYMENT_PENDING = "payment_pending"
+    # No payment happens before a restaurant decides — an order is placed,
+    # the restaurant accepts or rejects it, and only on acceptance does the
+    # student pay (directly to the restaurant's UPI ID, no gateway). This
+    # means a rejection never has to refund anything.
     STATUS_PLACED = "placed"
     STATUS_ACCEPTED = "accepted"
+    STATUS_PREPARING = "preparing"
     STATUS_REJECTED = "rejected"
     STATUS_READY = "ready"
     STATUS_COMPLETED = "completed"
     STATUS_CHOICES = [
-        (STATUS_PAYMENT_PENDING, "Payment pending"),
         (STATUS_PLACED, "Placed"),
         (STATUS_ACCEPTED, "Accepted"),
+        (STATUS_PREPARING, "Preparing"),
         (STATUS_REJECTED, "Rejected"),
         (STATUS_READY, "Ready for pickup"),
         (STATUS_COMPLETED, "Completed"),
     ]
 
     PAYMENT_PENDING = "pending"
-    PAYMENT_PAID = "paid"
-    PAYMENT_REFUNDED = "refunded"
-    PAYMENT_FAILED = "failed"
+    PAYMENT_CLAIMED = "claimed"
+    PAYMENT_CONFIRMED = "confirmed"
     PAYMENT_STATUS_CHOICES = [
         (PAYMENT_PENDING, "Pending"),
-        (PAYMENT_PAID, "Paid"),
-        (PAYMENT_REFUNDED, "Refunded"),
-        (PAYMENT_FAILED, "Failed"),
+        (PAYMENT_CLAIMED, "Claimed by student"),
+        (PAYMENT_CONFIRMED, "Confirmed by restaurant"),
     ]
 
     restaurant = models.ForeignKey(
@@ -113,14 +118,16 @@ class Order(models.Model):
     student_uid = models.CharField(max_length=50)
 
     status = models.CharField(
-        max_length=20, choices=STATUS_CHOICES, default=STATUS_PAYMENT_PENDING
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PLACED
     )
     payment_status = models.CharField(
         max_length=20, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_PENDING
     )
-    razorpay_order_id = models.CharField(max_length=64, blank=True)
-    razorpay_payment_id = models.CharField(max_length=64, blank=True)
-    razorpay_refund_id = models.CharField(max_length=64, blank=True)
+    # Student taps "I've paid" -> payment_claimed_at. Restaurant checks their
+    # own UPI app and confirms -> payment_confirmed_at. The restaurant's own
+    # confirmation is the real source of truth, not either timestamp alone.
+    payment_claimed_at = models.DateTimeField(null=True, blank=True)
+    payment_confirmed_at = models.DateTimeField(null=True, blank=True)
 
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
     estimated_ready_minutes = models.PositiveIntegerField(default=15)
@@ -129,12 +136,22 @@ class Order(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def mark_accepted(self):
-        self.status = self.STATUS_ACCEPTED
+    def mark_preparing(self):
+        self.status = self.STATUS_PREPARING
+        self.payment_status = self.PAYMENT_CONFIRMED
+        self.payment_confirmed_at = timezone.now()
         self.estimated_ready_at = timezone.now() + timezone.timedelta(
             minutes=self.estimated_ready_minutes
         )
-        self.save(update_fields=["status", "estimated_ready_at", "updated_at"])
+        self.save(
+            update_fields=[
+                "status",
+                "payment_status",
+                "payment_confirmed_at",
+                "estimated_ready_at",
+                "updated_at",
+            ]
+        )
 
     def __str__(self):
         return f"Order {self.order_code} ({self.restaurant.name})"
