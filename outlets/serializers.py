@@ -73,7 +73,7 @@ class OwnerRestaurantSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Restaurant
-        fields = ["id", "name", "slug", "logo", "is_open_today", "menu_items"]
+        fields = ["id", "name", "slug", "logo", "is_open_today", "upi_id", "menu_items"]
 
 
 class MenuItemCreateSerializer(serializers.ModelSerializer):
@@ -96,6 +96,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
     restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
+    # Only meaningful once the restaurant has accepted — that's when the
+    # student needs it to actually pay.
+    restaurant_upi_id = serializers.CharField(source="restaurant.upi_id", read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)
 
     class Meta:
@@ -104,10 +107,13 @@ class OrderSerializer(serializers.ModelSerializer):
             "order_code",
             "restaurant_name",
             "restaurant_slug",
+            "restaurant_upi_id",
             "student_name",
             "student_uid",
             "status",
             "payment_status",
+            "payment_claimed_at",
+            "payment_confirmed_at",
             "total_amount",
             "estimated_ready_minutes",
             "estimated_ready_at",
