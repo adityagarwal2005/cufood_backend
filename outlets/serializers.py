@@ -96,8 +96,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
     restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
-    # Only meaningful once the restaurant has accepted — that's when the
-    # student needs it to actually pay.
+    # Only meaningful once the restaurant has accepted (status=preparing) —
+    # that's when the student needs it to actually pay.
     restaurant_upi_id = serializers.CharField(source="restaurant.upi_id", read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)
 
@@ -113,7 +113,6 @@ class OrderSerializer(serializers.ModelSerializer):
             "status",
             "payment_status",
             "payment_claimed_at",
-            "payment_confirmed_at",
             "total_amount",
             "estimated_ready_minutes",
             "estimated_ready_at",

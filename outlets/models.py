@@ -84,15 +84,20 @@ class Order(models.Model):
     # the restaurant accepts or rejects it, and only on acceptance does the
     # student pay (directly to the restaurant's UPI ID, no gateway). This
     # means a rejection never has to refund anything.
+    #
+    # Accepting goes straight to "preparing" — there's no separate
+    # payment-confirmation step for the owner. The owner's own UPI app
+    # already buzzes them the instant money lands, so making them come back
+    # into this app just to tap "confirm payment" would be a second phone
+    # check for something they already saw. "I've paid" from the student is
+    # just a courtesy status update, not something the owner has to act on.
     STATUS_PLACED = "placed"
-    STATUS_ACCEPTED = "accepted"
     STATUS_PREPARING = "preparing"
     STATUS_REJECTED = "rejected"
     STATUS_READY = "ready"
     STATUS_COMPLETED = "completed"
     STATUS_CHOICES = [
         (STATUS_PLACED, "Placed"),
-        (STATUS_ACCEPTED, "Accepted"),
         (STATUS_PREPARING, "Preparing"),
         (STATUS_REJECTED, "Rejected"),
         (STATUS_READY, "Ready for pickup"),
@@ -101,11 +106,9 @@ class Order(models.Model):
 
     PAYMENT_PENDING = "pending"
     PAYMENT_CLAIMED = "claimed"
-    PAYMENT_CONFIRMED = "confirmed"
     PAYMENT_STATUS_CHOICES = [
         (PAYMENT_PENDING, "Pending"),
         (PAYMENT_CLAIMED, "Claimed by student"),
-        (PAYMENT_CONFIRMED, "Confirmed by restaurant"),
     ]
 
     restaurant = models.ForeignKey(
@@ -123,11 +126,9 @@ class Order(models.Model):
     payment_status = models.CharField(
         max_length=20, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_PENDING
     )
-    # Student taps "I've paid" -> payment_claimed_at. Restaurant checks their
-    # own UPI app and confirms -> payment_confirmed_at. The restaurant's own
-    # confirmation is the real source of truth, not either timestamp alone.
+    # Student taps "I've paid" -> payment_claimed_at. Purely informational;
+    # nothing in the owner flow waits on it.
     payment_claimed_at = models.DateTimeField(null=True, blank=True)
-    payment_confirmed_at = models.DateTimeField(null=True, blank=True)
 
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
     estimated_ready_minutes = models.PositiveIntegerField(default=15)
@@ -138,20 +139,10 @@ class Order(models.Model):
 
     def mark_preparing(self):
         self.status = self.STATUS_PREPARING
-        self.payment_status = self.PAYMENT_CONFIRMED
-        self.payment_confirmed_at = timezone.now()
         self.estimated_ready_at = timezone.now() + timezone.timedelta(
             minutes=self.estimated_ready_minutes
         )
-        self.save(
-            update_fields=[
-                "status",
-                "payment_status",
-                "payment_confirmed_at",
-                "estimated_ready_at",
-                "updated_at",
-            ]
-        )
+        self.save(update_fields=["status", "estimated_ready_at", "updated_at"])
 
     def __str__(self):
         return f"Order {self.order_code} ({self.restaurant.name})"

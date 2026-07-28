@@ -61,7 +61,6 @@ class OrderAdmin(admin.ModelAdmin):
     search_fields = ("order_code", "student_name", "student_uid")
     readonly_fields = (
         "payment_claimed_at",
-        "payment_confirmed_at",
         "created_at",
         "updated_at",
     )

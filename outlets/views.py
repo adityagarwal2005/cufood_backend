@@ -363,16 +363,16 @@ class CreateOrderView(APIView):
 
 class ClaimPaymentView(APIView):
     """Public — a student taps 'I've paid' on the order-status page after
-    sending money to the restaurant's UPI ID. This is a self-report, not
-    proof; the restaurant still checks their own UPI app before confirming
-    (see ConfirmPaymentView)."""
+    sending money to the restaurant's UPI ID. Purely a courtesy status
+    update for the student; the owner isn't waiting on this to do anything,
+    since their own UPI app already notifies them the instant money lands."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
     def patch(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
-        if order.status != Order.STATUS_ACCEPTED:
+        if order.status not in (Order.STATUS_PREPARING, Order.STATUS_READY):
             return Response(
                 {"detail": f"Order is '{order.status}', not awaiting payment."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -380,25 +380,6 @@ class ClaimPaymentView(APIView):
         order.payment_status = Order.PAYMENT_CLAIMED
         order.payment_claimed_at = timezone.now()
         order.save(update_fields=["payment_status", "payment_claimed_at", "updated_at"])
-        return Response(OrderSerializer(order).data)
-
-
-class ConfirmPaymentView(APIView):
-    """Owner confirms they've actually seen the money land in their own UPI
-    app, and starts preparing the order."""
-
-    permission_classes = [IsAuthenticated]
-
-    def patch(self, request, order_code):
-        order, error = get_order_for_owner(request.user, order_code)
-        if error is not None:
-            return error
-        if order.status != Order.STATUS_ACCEPTED:
-            return Response(
-                {"detail": f"Order is '{order.status}', not awaiting payment confirmation."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        order.mark_preparing()
         return Response(OrderSerializer(order).data)
 
 
@@ -416,7 +397,7 @@ class OrderStatusView(APIView):
 
 
 class MyOrdersView(APIView):
-    """Owner's order queue. Placed orders need a decision; accepted/ready
+    """Owner's order queue. Placed orders need a decision; preparing/ready
     ones are being tracked; everything else is recent history."""
 
     permission_classes = [IsAuthenticated]
@@ -433,8 +414,11 @@ class MyOrdersView(APIView):
 
 
 class AcceptOrderView(APIView):
-    """Accepting just says 'yes, we can make this' — the student is shown
-    the restaurant's UPI ID to pay next. No money has moved yet."""
+    """Accepting is the owner's one and only decision point — it says 'yes,
+    we can make this' AND starts prep immediately, in one tap. The student
+    is shown the restaurant's UPI ID to pay next; no money has moved yet.
+    There's deliberately no separate 'confirm payment' step for the owner
+    to come back to later — see the Order model docstring for why."""
 
     permission_classes = [IsAuthenticated]
 
@@ -447,8 +431,7 @@ class AcceptOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        order.status = Order.STATUS_ACCEPTED
-        order.save(update_fields=["status", "updated_at"])
+        order.mark_preparing()
         return Response(OrderSerializer(order).data)
 
 
