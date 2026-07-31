@@ -119,3 +119,12 @@ class OrderSerializer(serializers.ModelSerializer):
             "created_at",
             "items",
         ]
+
+
+class OwnerOrderSerializer(OrderSerializer):
+    """Same as OrderSerializer plus the student's checkout selfie — only
+    ever handed to the restaurant that owns the order, never the public
+    order-status lookup."""
+
+    class Meta(OrderSerializer.Meta):
+        fields = OrderSerializer.Meta.fields + ["student_photo"]

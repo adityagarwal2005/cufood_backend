@@ -17,6 +17,7 @@ from .serializers import (
     MenuItemCreateSerializer,
     OrderSerializer,
     OwnerMenuItemSerializer,
+    OwnerOrderSerializer,
     OwnerRestaurantSerializer,
     RestaurantDetailSerializer,
     RestaurantListSerializer,
@@ -275,6 +276,9 @@ class MenuItemDeleteView(APIView):
 
 
 MAX_ITEM_QUANTITY = 20
+# ~1.5MB of raw image data as base64 — comfortably more than a compressed
+# checkout selfie needs, just a sanity ceiling against abuse.
+MAX_PHOTO_LENGTH = 2_000_000
 
 
 class CreateOrderView(APIView):
@@ -289,6 +293,7 @@ class CreateOrderView(APIView):
         restaurant_slug = request.data.get("restaurant_slug")
         student_name = (request.data.get("student_name") or "").strip()
         student_uid = (request.data.get("student_uid") or "").strip()
+        student_photo = (request.data.get("student_photo") or "").strip()
         raw_items = request.data.get("items")
 
         if not restaurant_slug:
@@ -297,6 +302,10 @@ class CreateOrderView(APIView):
             return Response({"detail": "Your name is required."}, status=status.HTTP_400_BAD_REQUEST)
         if not student_uid:
             return Response({"detail": "Your UID is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not student_photo:
+            return Response({"detail": "A photo is required so the restaurant can identify you."}, status=status.HTTP_400_BAD_REQUEST)
+        if not student_photo.startswith("data:image/") or len(student_photo) > MAX_PHOTO_LENGTH:
+            return Response({"detail": "Invalid photo. Please retake it."}, status=status.HTTP_400_BAD_REQUEST)
         if not raw_items or not isinstance(raw_items, list):
             return Response({"detail": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -352,6 +361,7 @@ class CreateOrderView(APIView):
             restaurant=restaurant,
             student_name=student_name,
             student_uid=student_uid,
+            student_photo=student_photo,
             total_amount=total_amount,
         )
         for item in pending_items:
@@ -410,7 +420,7 @@ class MyOrdersView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
         orders = Order.objects.filter(restaurant=restaurant).order_by("-created_at")[:100]
-        return Response(OrderSerializer(orders, many=True).data)
+        return Response(OwnerOrderSerializer(orders, many=True).data)
 
 
 class AcceptOrderView(APIView):
@@ -432,7 +442,7 @@ class AcceptOrderView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         order.mark_preparing()
-        return Response(OrderSerializer(order).data)
+        return Response(OwnerOrderSerializer(order).data)
 
 
 class RejectOrderView(APIView):
@@ -452,7 +462,7 @@ class RejectOrderView(APIView):
             )
         order.status = Order.STATUS_REJECTED
         order.save(update_fields=["status", "updated_at"])
-        return Response(OrderSerializer(order).data)
+        return Response(OwnerOrderSerializer(order).data)
 
 
 class MarkOrderReadyView(APIView):
@@ -469,7 +479,7 @@ class MarkOrderReadyView(APIView):
             )
         order.status = Order.STATUS_READY
         order.save(update_fields=["status", "updated_at"])
-        return Response(OrderSerializer(order).data)
+        return Response(OwnerOrderSerializer(order).data)
 
 
 class CompleteOrderView(APIView):
@@ -486,4 +496,4 @@ class CompleteOrderView(APIView):
             )
         order.status = Order.STATUS_COMPLETED
         order.save(update_fields=["status", "updated_at"])
-        return Response(OrderSerializer(order).data)
+        return Response(OwnerOrderSerializer(order).data)

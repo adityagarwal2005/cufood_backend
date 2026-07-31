@@ -119,6 +119,10 @@ class Order(models.Model):
     )
     student_name = models.CharField(max_length=100)
     student_uid = models.CharField(max_length=50)
+    # A small selfie captured at checkout (base64 data URI), so the
+    # restaurant can match the person collecting the order to who placed
+    # it. Owner-only — never exposed on the public order-status lookup.
+    student_photo = models.TextField(blank=True)
 
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PLACED
@@ -131,7 +135,7 @@ class Order(models.Model):
     payment_claimed_at = models.DateTimeField(null=True, blank=True)
 
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
-    estimated_ready_minutes = models.PositiveIntegerField(default=15)
+    estimated_ready_minutes = models.PositiveIntegerField(default=12)
     estimated_ready_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
