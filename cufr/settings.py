@@ -194,6 +194,15 @@ if not DEBUG:
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    # The frontend (Vercel) and this backend (Render) are on different
+    # domains, so owner login is a cross-site request. Django's default
+    # SameSite=Lax cookies are dropped by the browser on cross-site
+    # fetch/XHR calls (only same-site or top-level link navigation are
+    # allowed), which breaks the session right after a successful login —
+    # "None" explicitly allows it. Requires Secure=True (above), which is
+    # already true since both sides are HTTPS.
+    SESSION_COOKIE_SAMESITE = "None"
+    CSRF_COOKIE_SAMESITE = "None"
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_HSTS_SECONDS = 3600
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
