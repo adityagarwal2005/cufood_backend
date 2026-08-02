@@ -260,8 +260,21 @@ class MenuItemCreateView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-class MenuItemDeleteView(APIView):
+class MenuItemDetailView(APIView):
     permission_classes = [IsAuthenticated]
+
+    def patch(self, request, item_id):
+        restaurant = get_owned_restaurant(request.user)
+        if restaurant is None:
+            return Response(
+                {"detail": "No restaurant linked to this account"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        item = get_object_or_404(MenuItem, id=item_id, restaurant=restaurant)
+        serializer = MenuItemCreateSerializer(item, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(OwnerMenuItemSerializer(item).data)
 
     def delete(self, request, item_id):
         restaurant = get_owned_restaurant(request.user)
