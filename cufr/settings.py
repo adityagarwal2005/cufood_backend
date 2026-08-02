@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework.authtoken",
     "corsheaders",
     "outlets",
 ]
@@ -141,8 +142,16 @@ STORAGES = {
 # Django REST Framework
 
 REST_FRAMEWORK = {
+    # Token, not session+CSRF: the frontend (Vercel) and backend (Render)
+    # are different domains, so JS on the frontend can never read a CSRF
+    # cookie the backend set (cookies are scoped to the domain that set
+    # them — SameSite doesn't change that). That silently 403'd every
+    # owner-authenticated PATCH/POST (toggle item, accept/reject order,
+    # etc.) while GETs still worked, since only mutations need the
+    # cross-domain-unreadable CSRF token. A bearer token sent as a normal
+    # header has no such cross-domain cookie dependency.
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework.authentication.TokenAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",

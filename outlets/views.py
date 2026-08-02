@@ -1,10 +1,9 @@
-from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth import authenticate
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework import status
+from rest_framework.authtoken.models import Token
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -144,16 +143,15 @@ class SearchView(APIView):
         return Response(list(counts.values()))
 
 
-@method_decorator(ensure_csrf_cookie, name="get")
-class CSRFView(APIView):
-    """GET this once from the frontend before making POST/PATCH/DELETE
-    requests, to receive a csrftoken cookie."""
-
-    def get(self, request):
-        return Response({"detail": "CSRF cookie set"})
-
-
 class LoginView(APIView):
+    """Returns a bearer token rather than relying on a session cookie —
+    the frontend (Vercel) and this backend (Render) are different domains,
+    and a session+CSRF-cookie scheme can't work across that: JS on the
+    frontend can never read a cookie the backend set (cookies are scoped
+    to the domain that set them, regardless of SameSite), so every
+    state-changing request would fail CSRF validation. A token sent as a
+    normal Authorization header has no such dependency."""
+
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "login"
 
@@ -165,13 +163,15 @@ class LoginView(APIView):
             return Response(
                 {"detail": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED
             )
-        login(request, user)
-        return Response({"detail": "Logged in"})
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({"detail": "Logged in", "token": token.key})
 
 
 class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
     def post(self, request):
-        logout(request)
+        request.user.auth_token.delete()
         return Response({"detail": "Logged out"})
 
 
