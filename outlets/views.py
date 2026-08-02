@@ -283,8 +283,10 @@ MAX_PHOTO_LENGTH = 2_000_000
 
 class CreateOrderView(APIView):
     """Validates a student's cart server-side (never trust client-sent
-    prices) and creates the Order + OrderItems in 'placed' state. No payment
-    happens here — that only occurs after the restaurant accepts."""
+    prices) and creates the Order + OrderItems in 'placed' state. The
+    student pays immediately after this — see ClaimPaymentView and
+    AcceptOrderView for why payment now happens before the restaurant
+    ever sees the order."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
@@ -294,6 +296,7 @@ class CreateOrderView(APIView):
         student_name = (request.data.get("student_name") or "").strip()
         student_uid = (request.data.get("student_uid") or "").strip()
         student_photo = (request.data.get("student_photo") or "").strip()
+        student_upi_id = (request.data.get("student_upi_id") or "").strip()
         raw_items = request.data.get("items")
 
         if not restaurant_slug:
@@ -306,6 +309,11 @@ class CreateOrderView(APIView):
             return Response({"detail": "A photo is required so the restaurant can identify you."}, status=status.HTTP_400_BAD_REQUEST)
         if not student_photo.startswith("data:image/") or len(student_photo) > MAX_PHOTO_LENGTH:
             return Response({"detail": "Invalid photo. Please retake it."}, status=status.HTTP_400_BAD_REQUEST)
+        if not student_upi_id or "@" not in student_upi_id:
+            return Response(
+                {"detail": "Your UPI ID is required (used only if a rejected order needs refunding)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not raw_items or not isinstance(raw_items, list):
             return Response({"detail": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -362,6 +370,7 @@ class CreateOrderView(APIView):
             student_name=student_name,
             student_uid=student_uid,
             student_photo=student_photo,
+            student_upi_id=student_upi_id,
             total_amount=total_amount,
         )
         for item in pending_items:
@@ -372,17 +381,18 @@ class CreateOrderView(APIView):
 
 
 class ClaimPaymentView(APIView):
-    """Public — a student taps 'I've paid' on the order-status page after
-    sending money to the restaurant's UPI ID. Purely a courtesy status
-    update for the student; the owner isn't waiting on this to do anything,
-    since their own UPI app already notifies them the instant money lands."""
+    """Public — a student taps 'I've paid' right after placing their order,
+    before the restaurant has seen it. This is what makes the order appear
+    in the owner's queue at all (see MyOrdersView) — it's a self-report,
+    not proof, but it's the signal that turns an invisible pending order
+    into one the owner can act on."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
     def patch(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
-        if order.status not in (Order.STATUS_PREPARING, Order.STATUS_READY):
+        if order.status not in (Order.STATUS_PLACED, Order.STATUS_PREPARING, Order.STATUS_READY):
             return Response(
                 {"detail": f"Order is '{order.status}', not awaiting payment."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -407,8 +417,11 @@ class OrderStatusView(APIView):
 
 
 class MyOrdersView(APIView):
-    """Owner's order queue. Placed orders need a decision; preparing/ready
-    ones are being tracked; everything else is recent history."""
+    """Owner's order queue. An unpaid 'placed' order is invisible here —
+    the owner never sees or waits on anything unpaid; by the time an order
+    shows up, it's already been paid for. Paid-and-placed orders need a
+    decision; preparing/ready ones are being tracked; everything else is
+    recent history."""
 
     permission_classes = [IsAuthenticated]
 
@@ -419,16 +432,18 @@ class MyOrdersView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        orders = Order.objects.filter(restaurant=restaurant).order_by("-created_at")[:100]
+        orders = Order.objects.filter(restaurant=restaurant).exclude(
+            status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING
+        ).order_by("-created_at")[:100]
         return Response(OwnerOrderSerializer(orders, many=True).data)
 
 
 class AcceptOrderView(APIView):
     """Accepting is the owner's one and only decision point — it says 'yes,
-    we can make this' AND starts prep immediately, in one tap. The student
-    is shown the restaurant's UPI ID to pay next; no money has moved yet.
-    There's deliberately no separate 'confirm payment' step for the owner
-    to come back to later — see the Order model docstring for why."""
+    we can make this' AND starts prep immediately, in one tap. That's safe
+    to do in one step because payment already happened before this order
+    was even visible to the owner (see MyOrdersView) — there's nothing left
+    to wait on."""
 
     permission_classes = [IsAuthenticated]
 
@@ -441,13 +456,21 @@ class AcceptOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if order.payment_status != Order.PAYMENT_CLAIMED:
+            return Response(
+                {"detail": "This order hasn't been paid yet."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         order.mark_preparing()
         return Response(OwnerOrderSerializer(order).data)
 
 
 class RejectOrderView(APIView):
-    """No payment has happened at this point, so rejecting is just a status
-    change — nothing to refund."""
+    """Since the order was already paid before the owner ever saw it (see
+    MyOrdersView), rejecting here almost always means refunding. There's no
+    gateway to do that automatically — the owner sends it back themselves,
+    but OwnerOrderSerializer hands them a pre-filled UPI link for it so
+    there's nothing to look up or type."""
 
     permission_classes = [IsAuthenticated]
 

@@ -80,17 +80,23 @@ class MenuItem(models.Model):
 
 
 class Order(models.Model):
-    # No payment happens before a restaurant decides — an order is placed,
-    # the restaurant accepts or rejects it, and only on acceptance does the
-    # student pay (directly to the restaurant's UPI ID, no gateway). This
-    # means a rejection never has to refund anything.
+    # Payment happens right after the student places the order — before the
+    # restaurant ever sees it. An order only becomes visible/actionable to
+    # the owner once payment_status is CLAIMED (see MyOrdersView), so from
+    # the owner's side there's no "waiting for payment" state to sit
+    # through: by the time an order reaches them, it's already paid, and
+    # Accept both confirms and starts prep in one tap.
     #
-    # Accepting goes straight to "preparing" — there's no separate
-    # payment-confirmation step for the owner. The owner's own UPI app
-    # already buzzes them the instant money lands, so making them come back
-    # into this app just to tap "confirm payment" would be a second phone
-    # check for something they already saw. "I've paid" from the student is
-    # just a courtesy status update, not something the owner has to act on.
+    # Real owners (not just app design) require this — they won't start
+    # cooking without seeing payment first, so payment can't happen after
+    # acceptance the way it used to.
+    #
+    # Rejecting an already-paid order is the one case with no gateway to
+    # auto-refund through. That's rare (item availability is already
+    # checked at order-creation time, so it's mostly "we're too busy right
+    # now"), and when it happens the owner gets a pre-filled UPI refund
+    # link (see OwnerOrderSerializer.get_refund_upi_link) rather than
+    # having to look up the student's UPI ID and type an amount by hand.
     STATUS_PLACED = "placed"
     STATUS_PREPARING = "preparing"
     STATUS_REJECTED = "rejected"
@@ -123,6 +129,10 @@ class Order(models.Model):
     # restaurant can match the person collecting the order to who placed
     # it. Owner-only — never exposed on the public order-status lookup.
     student_photo = models.TextField(blank=True)
+    # Collected at checkout solely so a rejected-after-payment order can
+    # offer the owner a pre-filled UPI refund link instead of them having
+    # to ask the student for it after the fact.
+    student_upi_id = models.CharField(max_length=100, blank=True)
 
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PLACED

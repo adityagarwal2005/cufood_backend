@@ -1,3 +1,5 @@
+from urllib.parse import urlencode
+
 from rest_framework import serializers
 
 from .models import Location, MenuItem, Order, OrderItem, Restaurant
@@ -96,8 +98,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
     restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
-    # Only meaningful once the restaurant has accepted (status=preparing) —
-    # that's when the student needs it to actually pay.
+    # Needed right after placing the order — payment happens before the
+    # restaurant ever sees it now, not after acceptance.
     restaurant_upi_id = serializers.CharField(source="restaurant.upi_id", read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)
 
@@ -122,9 +124,27 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class OwnerOrderSerializer(OrderSerializer):
-    """Same as OrderSerializer plus the student's checkout selfie — only
-    ever handed to the restaurant that owns the order, never the public
-    order-status lookup."""
+    """Same as OrderSerializer plus the student's checkout selfie and, when
+    relevant, a ready-to-tap UPI refund link — only ever handed to the
+    restaurant that owns the order, never the public order-status lookup."""
+
+    refund_upi_link = serializers.SerializerMethodField()
 
     class Meta(OrderSerializer.Meta):
-        fields = OrderSerializer.Meta.fields + ["student_photo"]
+        fields = OrderSerializer.Meta.fields + ["student_photo", "student_upi_id", "refund_upi_link"]
+
+    def get_refund_upi_link(self, order):
+        # Only meaningful for a paid order that got rejected — everything
+        # else either doesn't need refunding or hasn't been paid at all.
+        if order.status != Order.STATUS_REJECTED or order.payment_status != Order.PAYMENT_CLAIMED:
+            return None
+        if not order.student_upi_id:
+            return None
+        params = urlencode({
+            "pa": order.student_upi_id,
+            "pn": order.student_name,
+            "am": str(order.total_amount),
+            "cu": "INR",
+            "tn": f"CUFood refund {order.order_code}",
+        })
+        return f"upi://pay?{params}"
