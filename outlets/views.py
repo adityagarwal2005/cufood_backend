@@ -276,9 +276,6 @@ class MenuItemDeleteView(APIView):
 
 
 MAX_ITEM_QUANTITY = 20
-# ~1.5MB of raw image data as base64 — comfortably more than a compressed
-# checkout selfie needs, just a sanity ceiling against abuse.
-MAX_PHOTO_LENGTH = 2_000_000
 
 
 class CreateOrderView(APIView):
@@ -294,8 +291,6 @@ class CreateOrderView(APIView):
     def post(self, request):
         restaurant_slug = request.data.get("restaurant_slug")
         student_name = (request.data.get("student_name") or "").strip()
-        student_uid = (request.data.get("student_uid") or "").strip()
-        student_photo = (request.data.get("student_photo") or "").strip()
         student_upi_id = (request.data.get("student_upi_id") or "").strip()
         raw_items = request.data.get("items")
 
@@ -303,12 +298,6 @@ class CreateOrderView(APIView):
             return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
         if not student_name:
             return Response({"detail": "Your name is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not student_uid:
-            return Response({"detail": "Your UID is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not student_photo:
-            return Response({"detail": "A photo is required so the restaurant can identify you."}, status=status.HTTP_400_BAD_REQUEST)
-        if not student_photo.startswith("data:image/") or len(student_photo) > MAX_PHOTO_LENGTH:
-            return Response({"detail": "Invalid photo. Please retake it."}, status=status.HTTP_400_BAD_REQUEST)
         if not student_upi_id or "@" not in student_upi_id:
             return Response(
                 {"detail": "Your UPI ID is required (used only if a rejected order needs refunding)."},
@@ -368,8 +357,6 @@ class CreateOrderView(APIView):
         order = Order.objects.create(
             restaurant=restaurant,
             student_name=student_name,
-            student_uid=student_uid,
-            student_photo=student_photo,
             student_upi_id=student_upi_id,
             total_amount=total_amount,
         )

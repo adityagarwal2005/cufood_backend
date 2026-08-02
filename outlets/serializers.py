@@ -111,7 +111,6 @@ class OrderSerializer(serializers.ModelSerializer):
             "restaurant_slug",
             "restaurant_upi_id",
             "student_name",
-            "student_uid",
             "status",
             "payment_status",
             "payment_claimed_at",
@@ -124,14 +123,14 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class OwnerOrderSerializer(OrderSerializer):
-    """Same as OrderSerializer plus the student's checkout selfie and, when
-    relevant, a ready-to-tap UPI refund link — only ever handed to the
-    restaurant that owns the order, never the public order-status lookup."""
+    """Same as OrderSerializer plus, when relevant, a ready-to-tap UPI
+    refund link — only ever handed to the restaurant that owns the order,
+    never the public order-status lookup."""
 
     refund_upi_link = serializers.SerializerMethodField()
 
     class Meta(OrderSerializer.Meta):
-        fields = OrderSerializer.Meta.fields + ["student_photo", "student_upi_id", "refund_upi_link"]
+        fields = OrderSerializer.Meta.fields + ["student_upi_id", "refund_upi_link"]
 
     def get_refund_upi_link(self, order):
         # Only meaningful for a paid order that got rejected — everything

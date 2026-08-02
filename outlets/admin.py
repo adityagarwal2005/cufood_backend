@@ -51,16 +51,13 @@ class OrderAdmin(admin.ModelAdmin):
         "order_code",
         "restaurant",
         "student_name",
-        "student_uid",
         "status",
         "payment_status",
         "total_amount",
         "created_at",
     )
     list_filter = ("restaurant", "status", "payment_status")
-    search_fields = ("order_code", "student_name", "student_uid")
-    # student_photo is a large base64 blob — not useful to render in admin.
-    exclude = ("student_photo",)
+    search_fields = ("order_code", "student_name")
     readonly_fields = (
         "payment_claimed_at",
         "created_at",
