@@ -1,3 +1,5 @@
+import re
+
 from django.contrib.auth import authenticate
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -304,16 +306,19 @@ class CreateOrderView(APIView):
     def post(self, request):
         restaurant_slug = request.data.get("restaurant_slug")
         student_name = (request.data.get("student_name") or "").strip()
-        student_upi_id = (request.data.get("student_upi_id") or "").strip()
+        student_phone_number = (request.data.get("student_phone_number") or "").strip()
         raw_items = request.data.get("items")
 
         if not restaurant_slug:
             return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
         if not student_name:
             return Response({"detail": "Your name is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not student_upi_id or "@" not in student_upi_id:
+        # Digits only, 10-13 long — covers a plain 10-digit Indian mobile
+        # number and one with a +91/91 prefix, without being too strict
+        # about exactly how it's formatted.
+        if len(re.sub(r"\D", "", student_phone_number)) not in range(10, 14):
             return Response(
-                {"detail": "Your UPI ID is required (used only if a rejected order needs refunding)."},
+                {"detail": "A valid phone number is required (used only if a rejected order needs refunding)."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if not raw_items or not isinstance(raw_items, list):
@@ -370,7 +375,7 @@ class CreateOrderView(APIView):
         order = Order.objects.create(
             restaurant=restaurant,
             student_name=student_name,
-            student_upi_id=student_upi_id,
+            student_phone_number=student_phone_number,
             total_amount=total_amount,
         )
         for item in pending_items:

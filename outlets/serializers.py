@@ -1,5 +1,3 @@
-from urllib.parse import urlencode
-
 from rest_framework import serializers
 
 from .models import Location, MenuItem, Order, OrderItem, Restaurant
@@ -123,27 +121,13 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class OwnerOrderSerializer(OrderSerializer):
-    """Same as OrderSerializer plus, when relevant, a ready-to-tap UPI
-    refund link — only ever handed to the restaurant that owns the order,
-    never the public order-status lookup."""
-
-    refund_upi_link = serializers.SerializerMethodField()
+    """Same as OrderSerializer plus the student's phone number — only ever
+    handed to the restaurant that owns the order, never the public
+    order-status lookup. Used to refund a rejected-after-payment order via
+    the owner's own UPI app's "Pay via Mobile Number" option: UPI's
+    deep-link spec only supports payee VPA (pa=), not a phone number, so
+    unlike restaurant_upi_id this can't be turned into a tap-to-pay link
+    or QR — it's plain text for the owner to enter manually."""
 
     class Meta(OrderSerializer.Meta):
-        fields = OrderSerializer.Meta.fields + ["student_upi_id", "refund_upi_link"]
-
-    def get_refund_upi_link(self, order):
-        # Only meaningful for a paid order that got rejected — everything
-        # else either doesn't need refunding or hasn't been paid at all.
-        if order.status != Order.STATUS_REJECTED or order.payment_status != Order.PAYMENT_CLAIMED:
-            return None
-        if not order.student_upi_id:
-            return None
-        params = urlencode({
-            "pa": order.student_upi_id,
-            "pn": order.student_name,
-            "am": str(order.total_amount),
-            "cu": "INR",
-            "tn": f"CUFood refund {order.order_code}",
-        })
-        return f"upi://pay?{params}"
+        fields = OrderSerializer.Meta.fields + ["student_phone_number"]

@@ -124,10 +124,14 @@ class Order(models.Model):
         max_length=6, unique=True, default=generate_order_code, editable=False
     )
     student_name = models.CharField(max_length=100)
-    # Collected at checkout solely so a rejected-after-payment order can
-    # offer the owner a pre-filled UPI refund link instead of them having
-    # to ask the student for it after the fact.
-    student_upi_id = models.CharField(max_length=100, blank=True)
+    # Collected at checkout solely so a rejected-after-payment order gives
+    # the owner a number to refund via their UPI app's "Pay via Mobile
+    # Number" option, instead of having to ask the student for it after
+    # the fact. Not a VPA — UPI's deep-link spec only supports payee VPA
+    # (pa=), not a phone number, so this can't be turned into a tap-to-pay
+    # link or QR the way restaurant_upi_id can; it's shown as plain text
+    # for the owner to enter manually.
+    student_phone_number = models.CharField(max_length=20, blank=True)
 
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PLACED
