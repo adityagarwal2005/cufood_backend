@@ -94,9 +94,9 @@ class Order(models.Model):
     # Rejecting an already-paid order is the one case with no gateway to
     # auto-refund through. That's rare (item availability is already
     # checked at order-creation time, so it's mostly "we're too busy right
-    # now"), and when it happens the owner gets a pre-filled UPI refund
-    # link (see OwnerOrderSerializer.get_refund_upi_link) rather than
-    # having to look up the student's UPI ID and type an amount by hand.
+    # now"), and when it happens the owner gets the student's phone number
+    # (student_phone_number, below) to refund via their UPI app's "Pay via
+    # Mobile Number" option, rather than having to ask the student for it.
     STATUS_PLACED = "placed"
     STATUS_PREPARING = "preparing"
     STATUS_REJECTED = "rejected"

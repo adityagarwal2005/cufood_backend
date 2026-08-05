@@ -474,8 +474,8 @@ class RejectOrderView(APIView):
     """Since the order was already paid before the owner ever saw it (see
     MyOrdersView), rejecting here almost always means refunding. There's no
     gateway to do that automatically — the owner sends it back themselves,
-    but OwnerOrderSerializer hands them a pre-filled UPI link for it so
-    there's nothing to look up or type."""
+    using the student's phone number (see OwnerOrderSerializer) via their
+    UPI app's "Pay via Mobile Number" option."""
 
     permission_classes = [IsAuthenticated]
 
