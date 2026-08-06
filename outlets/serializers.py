@@ -115,6 +115,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "total_amount",
             "estimated_ready_minutes",
             "estimated_ready_at",
+            "scheduled_for",
             "created_at",
             "items",
         ]

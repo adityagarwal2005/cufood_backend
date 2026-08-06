@@ -4,6 +4,7 @@ from django.contrib.auth import authenticate
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.generics import ListAPIView, RetrieveAPIView
@@ -291,6 +292,29 @@ class MenuItemDetailView(APIView):
 
 
 MAX_ITEM_QUANTITY = 20
+# How far ahead a student can schedule a pickup — a same-day "beat the
+# lunch rush" window, not an indefinite-future booking system.
+MIN_SCHEDULE_LEAD_MINUTES = 10
+MAX_SCHEDULE_LEAD_HOURS = 4
+
+
+def parse_scheduled_for(raw_value):
+    """Returns (scheduled_for, error_message). error_message is None on
+    success; scheduled_for is None for both a null/absent input (ASAP)
+    and no error, so callers must check error_message, not truthiness."""
+    if not raw_value:
+        return None, None
+    scheduled_for = parse_datetime(raw_value)
+    if scheduled_for is None:
+        return None, "Invalid scheduled time."
+    if timezone.is_naive(scheduled_for):
+        scheduled_for = timezone.make_aware(scheduled_for, timezone.utc)
+    now = timezone.now()
+    if scheduled_for < now + timezone.timedelta(minutes=MIN_SCHEDULE_LEAD_MINUTES):
+        return None, f"Scheduled pickup must be at least {MIN_SCHEDULE_LEAD_MINUTES} minutes from now."
+    if scheduled_for > now + timezone.timedelta(hours=MAX_SCHEDULE_LEAD_HOURS):
+        return None, f"Scheduled pickup can't be more than {MAX_SCHEDULE_LEAD_HOURS} hours from now."
+    return scheduled_for, None
 
 
 class CreateOrderView(APIView):
@@ -323,6 +347,10 @@ class CreateOrderView(APIView):
             )
         if not raw_items or not isinstance(raw_items, list):
             return Response({"detail": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
+
+        scheduled_for, schedule_error = parse_scheduled_for(request.data.get("scheduled_for"))
+        if schedule_error:
+            return Response({"detail": schedule_error}, status=status.HTTP_400_BAD_REQUEST)
 
         restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
         if not restaurant.is_open_today:
@@ -377,6 +405,7 @@ class CreateOrderView(APIView):
             student_name=student_name,
             student_phone_number=student_phone_number,
             total_amount=total_amount,
+            scheduled_for=scheduled_for,
         )
         for item in pending_items:
             item.order = order

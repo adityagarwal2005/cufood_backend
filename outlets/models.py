@@ -146,15 +146,28 @@ class Order(models.Model):
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
     estimated_ready_minutes = models.PositiveIntegerField(default=12)
     estimated_ready_at = models.DateTimeField(null=True, blank=True)
+    # Null means "as soon as possible" — the default and by far the common
+    # case. When set, the student picked a future pickup slot at checkout
+    # (see CreateOrderView), and mark_preparing() below targets that time
+    # instead of "now + estimated_ready_minutes".
+    scheduled_for = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def mark_preparing(self):
         self.status = self.STATUS_PREPARING
-        self.estimated_ready_at = timezone.now() + timezone.timedelta(
-            minutes=self.estimated_ready_minutes
-        )
+        now = timezone.now()
+        asap_ready = now + timezone.timedelta(minutes=self.estimated_ready_minutes)
+        # A scheduled order accepted well ahead of its slot should still
+        # show that slot as the ready time, not "12 minutes from now" —
+        # but if it's accepted late (scheduled time already close or
+        # passed), fall back to the normal prep-time estimate so it
+        # doesn't show a ready time in the past.
+        if self.scheduled_for and self.scheduled_for > asap_ready:
+            self.estimated_ready_at = self.scheduled_for
+        else:
+            self.estimated_ready_at = asap_ready
         self.save(update_fields=["status", "estimated_ready_at", "updated_at"])
 
     def __str__(self):
