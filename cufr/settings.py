@@ -94,6 +94,16 @@ WSGI_APPLICATION = "cufr.wsgi.application"
 DATABASES = {
     "default": env.db("DATABASE_URL")
 }
+# Without this, Django opens a brand new TCP+TLS connection to Supabase
+# (a different network hop from Render) on every single request and tears
+# it down at the end — that handshake cost was likely the single biggest
+# contributor to "everything feels slow", more than query count or payload
+# size. Reusing the connection for 60s cuts that out of most requests.
+# CONN_HEALTH_CHECKS pairs with it so a connection that went stale during
+# its 60s (network blip, Supabase-side timeout) gets detected and replaced
+# instead of failing the request.
+DATABASES["default"]["CONN_MAX_AGE"] = 60
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
 
 
 # Password validation

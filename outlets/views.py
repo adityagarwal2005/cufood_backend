@@ -126,7 +126,10 @@ class RestaurantListView(ListAPIView):
 
 
 class RestaurantDetailView(RetrieveAPIView):
-    queryset = Restaurant.objects.all()
+    # select_related("location") folds what would otherwise be a second
+    # query (for RestaurantDetailSerializer.location) into the same query
+    # via a SQL JOIN — one less round-trip on the page a student hits most.
+    queryset = Restaurant.objects.select_related("location")
     serializer_class = RestaurantDetailSerializer
     lookup_field = "slug"
 
