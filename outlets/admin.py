@@ -59,7 +59,10 @@ class OrderAdmin(admin.ModelAdmin):
     list_filter = ("restaurant", "status", "payment_status")
     search_fields = ("order_code", "student_name")
     readonly_fields = (
-        "payment_claimed_at",
+        "razorpay_order_id",
+        "razorpay_payment_id",
+        "razorpay_refund_id",
+        "payment_confirmed_at",
         "created_at",
         "updated_at",
     )

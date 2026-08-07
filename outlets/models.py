@@ -39,8 +39,11 @@ class Restaurant(models.Model):
         Location, on_delete=models.PROTECT, related_name="restaurants"
     )
     contact_number = models.CharField(max_length=20, blank=True)
-    # Shown to a student once their order is accepted, so they can pay the
-    # restaurant directly (no payment gateway — see Order status machine).
+    # No longer where students pay (see Order — payment goes through
+    # Razorpay into the platform's own account now). This is where the
+    # platform sends the restaurant's earnings when forwarding them on;
+    # kept as the same field/label the owner already knows rather than
+    # adding a second one.
     upi_id = models.CharField(max_length=100, blank=True)
     owner = models.OneToOneField(
         settings.AUTH_USER_MODEL,
@@ -80,23 +83,27 @@ class MenuItem(models.Model):
 
 
 class Order(models.Model):
-    # Payment happens right after the student places the order — before the
-    # restaurant ever sees it. An order only becomes visible/actionable to
-    # the owner once payment_status is CLAIMED (see MyOrdersView), so from
-    # the owner's side there's no "waiting for payment" state to sit
-    # through: by the time an order reaches them, it's already paid, and
-    # Accept both confirms and starts prep in one tap.
+    # Money flow: the student pays Razorpay directly (not the restaurant's
+    # UPI ID) into this platform's own Razorpay account. CreateOrderView
+    # creates both this row and a matching Razorpay Order up front, in
+    # PAYMENT_PENDING. The only thing that ever moves payment_status to
+    # PAID is RazorpayWebhookView receiving and signature-verifying a
+    # payment.captured event from Razorpay's servers — there is no
+    # student-facing "I've paid" action anymore, deliberately: that was a
+    # self-report a student could tap without actually paying, and nothing
+    # stopped an owner from starting prep on the strength of it alone.
+    # Verification now happens server-to-server, independent of the
+    # student's device.
     #
-    # Real owners (not just app design) require this — they won't start
-    # cooking without seeing payment first, so payment can't happen after
-    # acceptance the way it used to.
+    # An order only becomes visible/actionable to the owner once
+    # payment_status is PAID (see MyOrdersView) — by the time it reaches
+    # them it's already genuinely paid, so Accept is just "yes, we can make
+    # this" and starts prep in one tap, same as before.
     #
-    # Rejecting an already-paid order is the one case with no gateway to
-    # auto-refund through. That's rare (item availability is already
-    # checked at order-creation time, so it's mostly "we're too busy right
-    # now"), and when it happens the owner gets the student's phone number
-    # (student_phone_number, below) to refund via their UPI app's "Pay via
-    # Mobile Number" option, rather than having to ask the student for it.
+    # Rejecting a paid order triggers an automatic refund through Razorpay
+    # (see RejectOrderView) rather than the owner having to pay the student
+    # back themselves — the platform holds the money, so the platform (via
+    # the API, not a person) is what issues it back.
     STATUS_PLACED = "placed"
     STATUS_PREPARING = "preparing"
     STATUS_REJECTED = "rejected"
@@ -111,10 +118,12 @@ class Order(models.Model):
     ]
 
     PAYMENT_PENDING = "pending"
-    PAYMENT_CLAIMED = "claimed"
+    PAYMENT_PAID = "paid"
+    PAYMENT_REFUNDED = "refunded"
     PAYMENT_STATUS_CHOICES = [
         (PAYMENT_PENDING, "Pending"),
-        (PAYMENT_CLAIMED, "Claimed by student"),
+        (PAYMENT_PAID, "Paid"),
+        (PAYMENT_REFUNDED, "Refunded"),
     ]
 
     restaurant = models.ForeignKey(
@@ -124,13 +133,10 @@ class Order(models.Model):
         max_length=6, unique=True, default=generate_order_code, editable=False
     )
     student_name = models.CharField(max_length=100)
-    # Collected at checkout solely so a rejected-after-payment order gives
-    # the owner a number to refund via their UPI app's "Pay via Mobile
-    # Number" option, instead of having to ask the student for it after
-    # the fact. Not a VPA — UPI's deep-link spec only supports payee VPA
-    # (pa=), not a phone number, so this can't be turned into a tap-to-pay
-    # link or QR the way restaurant_upi_id can; it's shown as plain text
-    # for the owner to enter manually.
+    # Collected at checkout for the restaurant to reach the student directly
+    # if needed (e.g. an issue with the order) — refunds no longer go
+    # through this at all now that Razorpay refunds the original payment
+    # method automatically on reject.
     student_phone_number = models.CharField(max_length=20, blank=True)
 
     status = models.CharField(
@@ -139,9 +145,16 @@ class Order(models.Model):
     payment_status = models.CharField(
         max_length=20, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_PENDING
     )
-    # Student taps "I've paid" -> payment_claimed_at. Purely informational;
-    # nothing in the owner flow waits on it.
-    payment_claimed_at = models.DateTimeField(null=True, blank=True)
+    # Set by CreateOrderView when the Razorpay Order is created — needed to
+    # open Checkout and to match an incoming webhook back to this row.
+    razorpay_order_id = models.CharField(max_length=64, blank=True)
+    # Set by RazorpayWebhookView once payment.captured is verified.
+    razorpay_payment_id = models.CharField(max_length=64, blank=True)
+    # Set by RejectOrderView after issuing a refund via the Razorpay API.
+    razorpay_refund_id = models.CharField(max_length=64, blank=True)
+    # Webhook-confirmed payment time — this is real, unlike the old
+    # self-reported "I've paid" timestamp it replaces.
+    payment_confirmed_at = models.DateTimeField(null=True, blank=True)
 
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
     estimated_ready_minutes = models.PositiveIntegerField(default=12)

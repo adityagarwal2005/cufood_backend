@@ -197,6 +197,17 @@ if RENDER_EXTERNAL_HOSTNAME:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
 
 
+# Razorpay — students pay into this account (the platform's own), not each
+# restaurant's UPI ID directly. See CreateOrderView / RazorpayWebhookView in
+# outlets/views.py for the actual flow. Use rzp_test_* keys while developing;
+# swap to live keys only once the webhook is verified end-to-end.
+RAZORPAY_KEY_ID = env.str("RAZORPAY_KEY_ID", default="")
+RAZORPAY_KEY_SECRET = env.str("RAZORPAY_KEY_SECRET", default="")
+# Configured separately in the Razorpay dashboard under the webhook you
+# create there — not the same as the API key secret above.
+RAZORPAY_WEBHOOK_SECRET = env.str("RAZORPAY_WEBHOOK_SECRET", default="")
+
+
 # Production hardening (only applies when DEBUG=False, i.e. on Render)
 
 if not DEBUG:

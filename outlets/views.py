@@ -1,5 +1,9 @@
+import json
+import logging
 import re
 
+import razorpay
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -8,12 +12,24 @@ from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.generics import ListAPIView, RetrieveAPIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from .models import Location, MenuItem, Order, OrderItem, Restaurant
+
+logger = logging.getLogger(__name__)
+
+
+def get_razorpay_client():
+    return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
+
+def rupees_to_paise(amount):
+    """Decimal rupees -> integer paise, the unit Razorpay's API expects.
+    Decimal arithmetic throughout avoids float rounding surprises on money."""
+    return int((amount * 100).to_integral_value())
 from .serializers import (
     LocationSerializer,
     MenuItemCreateSerializer,
@@ -207,8 +223,9 @@ class ToggleRestaurantOpenView(APIView):
 
 
 class UpdateUpiIdView(APIView):
-    """Lets an owner set the UPI ID students pay once their order is
-    accepted. No format validation beyond "looks like a VPA" — restaurants
+    """Lets an owner set the UPI ID their order earnings get forwarded to
+    (see Restaurant.upi_id) — students pay through Razorpay now, not this
+    directly. No format validation beyond "looks like a VPA" — restaurants
     know their own UPI ID better than a regex would."""
 
     permission_classes = [IsAuthenticated]
@@ -319,10 +336,11 @@ def parse_scheduled_for(raw_value):
 
 class CreateOrderView(APIView):
     """Validates a student's cart server-side (never trust client-sent
-    prices) and creates the Order + OrderItems in 'placed' state. The
-    student pays immediately after this — see ClaimPaymentView and
-    AcceptOrderView for why payment now happens before the restaurant
-    ever sees the order."""
+    prices), creates the Order + OrderItems in 'placed'/payment 'pending',
+    and opens a matching Razorpay Order so the frontend can launch Checkout
+    immediately after. Payment itself is confirmed later, server-to-server,
+    by RazorpayWebhookView — nothing here or on the student's device marks
+    an order as paid."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
@@ -342,7 +360,7 @@ class CreateOrderView(APIView):
         # about exactly how it's formatted.
         if len(re.sub(r"\D", "", student_phone_number)) not in range(10, 14):
             return Response(
-                {"detail": "A valid phone number is required (used only if a rejected order needs refunding)."},
+                {"detail": "A valid phone number is required, so the restaurant can reach you about your order."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if not raw_items or not isinstance(raw_items, list):
@@ -411,30 +429,119 @@ class CreateOrderView(APIView):
             item.order = order
         OrderItem.objects.bulk_create(pending_items)
 
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        try:
+            razorpay_order = get_razorpay_client().order.create({
+                "amount": rupees_to_paise(order.total_amount),
+                "currency": "INR",
+                "receipt": order.order_code,
+                "notes": {"order_code": order.order_code, "restaurant_slug": restaurant.slug},
+            })
+        except Exception:
+            # Don't leave an Order row around that can never be paid for —
+            # the student sees a normal "try again" error, not a dead order
+            # sitting invisibly in pending forever.
+            logger.exception("Razorpay order.create failed for %s", order.order_code)
+            order.delete()
+            return Response(
+                {"detail": "Could not start payment. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        order.razorpay_order_id = razorpay_order["id"]
+        order.save(update_fields=["razorpay_order_id", "updated_at"])
+
+        data = OrderSerializer(order).data
+        data["razorpay_order_id"] = razorpay_order["id"]
+        data["razorpay_key_id"] = settings.RAZORPAY_KEY_ID
+        return Response(data, status=status.HTTP_201_CREATED)
 
 
-class ClaimPaymentView(APIView):
-    """Public — a student taps 'I've paid' right after placing their order,
-    before the restaurant has seen it. This is what makes the order appear
-    in the owner's queue at all (see MyOrdersView) — it's a self-report,
-    not proof, but it's the signal that turns an invisible pending order
-    into one the owner can act on."""
+class RetryPaymentView(APIView):
+    """Public — if a student closes the Razorpay Checkout modal without
+    paying (or it fails), the order they already have a pickup code for is
+    still sitting there in payment 'pending'. Rather than making them
+    abandon it and place a whole new order, this hands back the same
+    Razorpay order details so Checkout can be reopened for it."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
-    def patch(self, request, order_code):
+    def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
-        if order.status not in (Order.STATUS_PLACED, Order.STATUS_PREPARING, Order.STATUS_READY):
+        if order.payment_status != Order.PAYMENT_PENDING:
             return Response(
-                {"detail": f"Order is '{order.status}', not awaiting payment."},
+                {"detail": f"This order is already '{order.payment_status}'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        order.payment_status = Order.PAYMENT_CLAIMED
-        order.payment_claimed_at = timezone.now()
-        order.save(update_fields=["payment_status", "payment_claimed_at", "updated_at"])
-        return Response(OrderSerializer(order).data)
+        if not order.razorpay_order_id:
+            return Response(
+                {"detail": "No payment was ever started for this order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({
+            "razorpay_order_id": order.razorpay_order_id,
+            "razorpay_key_id": settings.RAZORPAY_KEY_ID,
+            "amount": order.total_amount,
+            "restaurant_name": order.restaurant.name,
+            "student_name": order.student_name,
+        })
+
+
+class RazorpayWebhookView(APIView):
+    """Public, unauthenticated — but not unverified. Razorpay's servers
+    call this directly the moment a payment actually succeeds, independent
+    of the student's browser/device. The signature check below is what
+    stops anyone else from being able to POST a fake 'payment succeeded'
+    here; nothing is trusted until that passes."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def post(self, request):
+        raw_body = request.body
+        signature = request.headers.get("X-Razorpay-Signature", "")
+
+        try:
+            get_razorpay_client().utility.verify_webhook_signature(
+                raw_body.decode("utf-8"), signature, settings.RAZORPAY_WEBHOOK_SECRET
+            )
+        except razorpay.errors.SignatureVerificationError:
+            logger.warning("Razorpay webhook signature verification failed")
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        payload = json.loads(raw_body)
+        event = payload.get("event")
+        if event != "payment.captured":
+            # We only act on capture events; anything else (authorized,
+            # failed, refund events we triggered ourselves, etc.) is
+            # acknowledged so Razorpay stops retrying it, but ignored.
+            return Response(status=status.HTTP_200_OK)
+
+        payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        razorpay_order_id = payment_entity.get("order_id")
+        razorpay_payment_id = payment_entity.get("id")
+        if not razorpay_order_id or not razorpay_payment_id:
+            return Response(status=status.HTTP_200_OK)
+
+        order = Order.objects.filter(razorpay_order_id=razorpay_order_id).first()
+        if order is None:
+            logger.warning("Razorpay webhook for unknown order_id=%s", razorpay_order_id)
+            return Response(status=status.HTTP_200_OK)
+
+        # Idempotent: Razorpay can and does redeliver webhooks. Only ever
+        # transition pending -> paid once; a redelivery after that is a
+        # no-op, not a re-processing.
+        if order.payment_status == Order.PAYMENT_PENDING:
+            order.payment_status = Order.PAYMENT_PAID
+            order.razorpay_payment_id = razorpay_payment_id
+            order.payment_confirmed_at = timezone.now()
+            order.save(update_fields=[
+                "payment_status", "razorpay_payment_id", "payment_confirmed_at", "updated_at",
+            ])
+
+        return Response(status=status.HTTP_200_OK)
 
 
 class OrderStatusView(APIView):
@@ -475,9 +582,10 @@ class MyOrdersView(APIView):
 class AcceptOrderView(APIView):
     """Accepting is the owner's one and only decision point — it says 'yes,
     we can make this' AND starts prep immediately, in one tap. That's safe
-    to do in one step because payment already happened before this order
-    was even visible to the owner (see MyOrdersView) — there's nothing left
-    to wait on."""
+    to do in one step because payment is verified (via RazorpayWebhookView,
+    not a self-report) before this order was even visible to the owner
+    (see MyOrdersView) — there's nothing left to wait on, and nothing for
+    the owner to double-check themselves."""
 
     permission_classes = [IsAuthenticated]
 
@@ -490,7 +598,7 @@ class AcceptOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if order.payment_status != Order.PAYMENT_CLAIMED:
+        if order.payment_status != Order.PAYMENT_PAID:
             return Response(
                 {"detail": "This order hasn't been paid yet."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -501,10 +609,12 @@ class AcceptOrderView(APIView):
 
 class RejectOrderView(APIView):
     """Since the order was already paid before the owner ever saw it (see
-    MyOrdersView), rejecting here almost always means refunding. There's no
-    gateway to do that automatically — the owner sends it back themselves,
-    using the student's phone number (see OwnerOrderSerializer) via their
-    UPI app's "Pay via Mobile Number" option."""
+    MyOrdersView), rejecting a paid order triggers a refund through the
+    Razorpay API right here — back to the same account/card the student
+    paid with, automatically. Nobody has to remember to send money back
+    manually; if the refund call itself fails, the order is deliberately
+    left un-rejected so the owner can just try again rather than the order
+    silently ending up 'rejected' with no refund actually issued."""
 
     permission_classes = [IsAuthenticated]
 
@@ -517,8 +627,24 @@ class RejectOrderView(APIView):
                 {"detail": f"Order is '{order.status}', not awaiting a decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        if order.payment_status == Order.PAYMENT_PAID:
+            try:
+                refund = get_razorpay_client().payment.refund(
+                    order.razorpay_payment_id,
+                    {"amount": rupees_to_paise(order.total_amount), "speed": "optimum"},
+                )
+            except Exception:
+                logger.exception("Razorpay refund failed for %s", order.order_code)
+                return Response(
+                    {"detail": "Could not process the refund right now. Please try rejecting again in a moment."},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            order.razorpay_refund_id = refund["id"]
+            order.payment_status = Order.PAYMENT_REFUNDED
+
         order.status = Order.STATUS_REJECTED
-        order.save(update_fields=["status", "updated_at"])
+        order.save(update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"])
         return Response(OwnerOrderSerializer(order).data)
 
 

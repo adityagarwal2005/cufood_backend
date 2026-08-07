@@ -96,9 +96,6 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
     restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
-    # Needed right after placing the order — payment happens before the
-    # restaurant ever sees it now, not after acceptance.
-    restaurant_upi_id = serializers.CharField(source="restaurant.upi_id", read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)
 
     class Meta:
@@ -107,11 +104,10 @@ class OrderSerializer(serializers.ModelSerializer):
             "order_code",
             "restaurant_name",
             "restaurant_slug",
-            "restaurant_upi_id",
             "student_name",
             "status",
             "payment_status",
-            "payment_claimed_at",
+            "payment_confirmed_at",
             "total_amount",
             "estimated_ready_minutes",
             "estimated_ready_at",
@@ -124,11 +120,9 @@ class OrderSerializer(serializers.ModelSerializer):
 class OwnerOrderSerializer(OrderSerializer):
     """Same as OrderSerializer plus the student's phone number — only ever
     handed to the restaurant that owns the order, never the public
-    order-status lookup. Used to refund a rejected-after-payment order via
-    the owner's own UPI app's "Pay via Mobile Number" option: UPI's
-    deep-link spec only supports payee VPA (pa=), not a phone number, so
-    unlike restaurant_upi_id this can't be turned into a tap-to-pay link
-    or QR — it's plain text for the owner to enter manually."""
+    order-status lookup. Now just a contact number (e.g. to reach the
+    student about an issue) — refunds go through Razorpay automatically on
+    reject, not via the owner paying the student back themselves."""
 
     class Meta(OrderSerializer.Meta):
         fields = OrderSerializer.Meta.fields + ["student_phone_number"]
