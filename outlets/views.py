@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from .models import Location, MenuItem, Order, OrderItem, Restaurant
+from .models import Location, MenuItem, Order, OrderItem, Restaurant, is_within_business_hours
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,20 @@ class CreateOrderView(APIView):
         scheduled_for, schedule_error = parse_scheduled_for(request.data.get("scheduled_for"))
         if schedule_error:
             return Response({"detail": schedule_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Every outlet on campus runs the same real-world hours — this is a
+        # campus-wide rule, not a per-restaurant setting, so it's checked
+        # here independent of the restaurant's own is_open_today toggle.
+        if not is_within_business_hours():
+            return Response(
+                {"detail": "Ordering is only available 10 AM – 6 PM, Monday–Friday."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if scheduled_for and not is_within_business_hours(scheduled_for):
+            return Response(
+                {"detail": "That pickup time is outside our 10 AM – 6 PM, Monday–Friday hours."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
         if not restaurant.is_open_today:

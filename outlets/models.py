@@ -1,10 +1,24 @@
 import random
 import string
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from django.utils.text import slugify
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def is_within_business_hours(now=None):
+    """All outlets run the same real-world hours: 10am-6pm IST, Mon-Fri.
+    Campus-wide, not per-restaurant — there's no version of this business
+    where an outlet is legitimately open outside these hours, so it's
+    enforced as a hard rule rather than something owners can override
+    from the dashboard (see CreateOrderView and the restaurant serializers,
+    which both call this instead of just checking Restaurant.is_open_today)."""
+    now = (now or timezone.now()).astimezone(IST)
+    return now.weekday() < 5 and 10 <= now.hour < 18
 
 
 def generate_order_code():
@@ -57,6 +71,13 @@ class Restaurant(models.Model):
         if not self.slug:
             self.slug = slugify(self.name)
         super().save(*args, **kwargs)
+
+    @property
+    def is_currently_open(self):
+        """What students should see: the owner's manual toggle AND real
+        business hours both have to say open. Outside 10am-6pm IST Mon-Fri
+        this is always False, even if an owner left the toggle on."""
+        return self.is_open_today and is_within_business_hours()
 
     def __str__(self):
         return self.name

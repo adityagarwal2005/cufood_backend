@@ -11,6 +11,7 @@ class LocationSerializer(serializers.ModelSerializer):
 
 class RestaurantListSerializer(serializers.ModelSerializer):
     logo = serializers.CharField(source="photo")
+    is_open_today = serializers.BooleanField(source="is_currently_open", read_only=True)
 
     class Meta:
         model = Restaurant
@@ -30,6 +31,7 @@ class RestaurantDetailSerializer(serializers.ModelSerializer):
     logo = serializers.CharField(source="photo")
     location = LocationSerializer(read_only=True)
     menu_items = serializers.SerializerMethodField()
+    is_open_today = serializers.BooleanField(source="is_currently_open", read_only=True)
 
     class Meta:
         model = Restaurant
