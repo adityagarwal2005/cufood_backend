@@ -485,6 +485,12 @@ class RetryPaymentView(APIView):
 
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
+        order.expire_if_stale()
+        if order.payment_status == Order.PAYMENT_EXPIRED:
+            return Response(
+                {"detail": "This order has expired — please place a new order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if order.payment_status != Order.PAYMENT_PENDING:
             return Response(
                 {"detail": f"This order is already '{order.payment_status}'."},
@@ -548,9 +554,14 @@ class RazorpayWebhookView(APIView):
             return Response(status=status.HTTP_200_OK)
 
         # Idempotent: Razorpay can and does redeliver webhooks. Only ever
-        # transition pending -> paid once; a redelivery after that is a
-        # no-op, not a re-processing.
-        if order.payment_status == Order.PAYMENT_PENDING:
+        # transition into paid once; a redelivery after that is a no-op,
+        # not a re-processing. EXPIRED is included alongside PENDING here
+        # on purpose — expire_if_stale() only stops the app from showing a
+        # stale checkout, it's never a claim that no payment could still
+        # land. If one genuinely did (this webhook firing proves it), that
+        # takes priority over the lazy expiry every time; real money moving
+        # always wins over a UI-only status.
+        if order.payment_status in (Order.PAYMENT_PENDING, Order.PAYMENT_EXPIRED):
             order.payment_status = Order.PAYMENT_PAID
             order.razorpay_payment_id = razorpay_payment_id
             order.payment_confirmed_at = timezone.now()
@@ -571,6 +582,7 @@ class OrderStatusView(APIView):
 
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
+        order.expire_if_stale()
         return Response(OrderSerializer(order).data)
 
 

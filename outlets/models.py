@@ -141,11 +141,27 @@ class Order(models.Model):
     PAYMENT_PENDING = "pending"
     PAYMENT_PAID = "paid"
     PAYMENT_REFUNDED = "refunded"
+    # A checkout that was started (Razorpay order created) but never
+    # completed within STALE_PENDING_MINUTES — the student closed the
+    # modal, lost signal, whatever. Lazily applied (see expire_if_stale())
+    # rather than needing a cron job: nothing else in this app runs on a
+    # schedule, so "check and flip on next read" avoids adding that
+    # infrastructure just for this. Distinct from PENDING so the frontend
+    # can stop showing an infinite "confirming payment" spinner and the
+    # retry-payment button can refuse to reopen a stale checkout.
+    PAYMENT_EXPIRED = "expired"
     PAYMENT_STATUS_CHOICES = [
         (PAYMENT_PENDING, "Pending"),
         (PAYMENT_PAID, "Paid"),
         (PAYMENT_REFUNDED, "Refunded"),
+        (PAYMENT_EXPIRED, "Expired"),
     ]
+
+    # How long a checkout can sit unpaid before it's considered abandoned.
+    # Long enough that a student fumbling with their banking app isn't cut
+    # off mid-payment, short enough that "expired" actually means
+    # something by the time anyone sees it.
+    STALE_PENDING_MINUTES = 60
 
     restaurant = models.ForeignKey(
         Restaurant, on_delete=models.PROTECT, related_name="orders"
@@ -188,6 +204,21 @@ class Order(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def expire_if_stale(self):
+        """Called on read (order lookup, retry-payment) rather than on a
+        schedule. Only ever touches PENDING orders — PAID/REFUNDED/already-
+        EXPIRED are left alone, and a real payment.captured webhook is
+        still honored for an EXPIRED order (see RazorpayWebhookView): this
+        only stops the app from showing an infinite spinner or letting a
+        student reopen a stale checkout, it never discards a payment that
+        actually went through."""
+        if self.payment_status != self.PAYMENT_PENDING:
+            return
+        age = timezone.now() - self.created_at
+        if age > timezone.timedelta(minutes=self.STALE_PENDING_MINUTES):
+            self.payment_status = self.PAYMENT_EXPIRED
+            self.save(update_fields=["payment_status", "updated_at"])
 
     def mark_preparing(self):
         self.status = self.STATUS_PREPARING
