@@ -736,12 +736,31 @@ class RejectOrderView(APIView):
                     order.razorpay_payment_id,
                     {"amount": rupees_to_paise(order.total_amount), "speed": "optimum"},
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Razorpay refund failed for %s", order.order_code)
-                return Response(
-                    {"detail": "Could not process the refund right now. Please try rejecting again in a moment."},
-                    status=status.HTTP_502_BAD_GATEWAY,
+                # Razorpay's own error responses are already human-readable
+                # (e.g. "refunds are not enabled for this account yet") —
+                # surfacing that instead of a generic message is the
+                # difference between an owner knowing this is a Razorpay
+                # account-level hold (new accounts can't refund until their
+                # first settlement clears) versus assuming the app is
+                # broken and hammering "try again."
+                razorpay_detail = None
+                response_body = getattr(exc, "http_body", None) or getattr(exc, "message", None)
+                if isinstance(response_body, (str, bytes)):
+                    try:
+                        parsed = json.loads(response_body)
+                        razorpay_detail = parsed.get("error", {}).get("description")
+                    except (ValueError, AttributeError):
+                        razorpay_detail = None
+                detail = (
+                    f"Refund failed: {razorpay_detail}"
+                    if razorpay_detail
+                    else "Could not process the refund right now. This can happen on a brand-new "
+                    "Razorpay account before its first settlement clears — check Razorpay's dashboard "
+                    "or contact their support if this keeps happening."
                 )
+                return Response({"detail": detail}, status=status.HTTP_502_BAD_GATEWAY)
             order.razorpay_refund_id = refund["id"]
             order.payment_status = Order.PAYMENT_REFUNDED
 
