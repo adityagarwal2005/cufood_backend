@@ -732,13 +732,15 @@ class RejectOrderView(APIView):
 
         if order.payment_status == Order.PAYMENT_PAID:
             try:
-                # "normal" speed (Razorpay's standard refund, ~5-7 business
-                # days, no extra charge) rather than "optimum" (attempts an
-                # instant refund, which carries a per-refund fee Razorpay
-                # confirmed directly) — deliberate choice, not the default.
+                # "optimum" attempts an instant refund (small per-refund fee,
+                # confirmed with Razorpay directly) rather than "normal"
+                # (free, 5-7 business days) — deliberate choice: rejections
+                # should be rare, and a student getting their money back
+                # same-day after a bad experience (their order got declined)
+                # matters more than the small fee.
                 refund = get_razorpay_client().payment.refund(
                     order.razorpay_payment_id,
-                    {"amount": rupees_to_paise(order.total_amount), "speed": "normal"},
+                    {"amount": rupees_to_paise(order.total_amount), "speed": "optimum"},
                 )
             except Exception as exc:
                 logger.exception("Razorpay refund failed for %s", order.order_code)
