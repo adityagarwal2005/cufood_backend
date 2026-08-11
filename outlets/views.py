@@ -9,6 +9,7 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from pywebpush import WebPushException, webpush
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.generics import ListAPIView, RetrieveAPIView
@@ -17,9 +18,52 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from .models import Location, MenuItem, Order, OrderItem, Restaurant, is_within_business_hours
+from .models import (
+    Location,
+    MenuItem,
+    Order,
+    OrderItem,
+    PushSubscription,
+    Restaurant,
+    is_within_business_hours,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def send_order_push(order, title, body):
+    """Best-effort — a student's status page works fine over polling alone
+    (see order-status.js), this is a bonus that fires a real system
+    notification even if they've closed the tab/app. Failures here should
+    never break the actual status transition (accept/reject/ready) that
+    triggered them, so every exception is swallowed after logging.
+    A 410 Gone means the browser/OS revoked that subscription (uninstalled,
+    permission revoked, etc.) — deleting it rather than retrying it forever."""
+    if not settings.VAPID_PRIVATE_KEY:
+        return
+    for sub in order.push_subscriptions.all():
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub.endpoint,
+                    "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
+                },
+                data=json.dumps({
+                    "title": title,
+                    "body": body,
+                    "url": f"/order-status.html?code={order.order_code}",
+                }),
+                vapid_private_key=settings.VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
+            )
+        except WebPushException as err:
+            status_code = getattr(err.response, "status_code", None)
+            if status_code == 410:
+                sub.delete()
+            else:
+                logger.warning("Push failed for order %s: %s", order.order_code, err)
+        except Exception:
+            logger.exception("Unexpected error sending push for order %s", order.order_code)
 
 
 def get_razorpay_client():
@@ -586,6 +630,34 @@ class OrderStatusView(APIView):
         return Response(OrderSerializer(order).data)
 
 
+class SubscribeOrderPushView(APIView):
+    """Called from order-status.html once a student grants notification
+    permission — stores their browser's Web Push subscription against this
+    specific order so send_order_push() (see AcceptOrderView/RejectOrderView/
+    MarkOrderReadyView) can reach them even after they close the tab/app.
+    No login involved, same as the rest of the order-status flow — anyone
+    with the order code can subscribe, which is fine since that's already
+    the same amount of access the status page itself grants."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def post(self, request, order_code):
+        order = get_object_or_404(Order, order_code=order_code.upper())
+        endpoint = request.data.get("endpoint")
+        keys = request.data.get("keys") or {}
+        p256dh = keys.get("p256dh")
+        auth = keys.get("auth")
+        if not endpoint or not p256dh or not auth:
+            return Response({"detail": "Invalid subscription."}, status=status.HTTP_400_BAD_REQUEST)
+
+        PushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={"order": order, "p256dh": p256dh, "auth": auth},
+        )
+        return Response(status=status.HTTP_201_CREATED)
+
+
 class MyOrdersView(APIView):
     """Owner's order queue. An unpaid 'placed' order is invisible here —
     the owner never sees or waits on anything unpaid; by the time an order
@@ -633,6 +705,7 @@ class AcceptOrderView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         order.mark_preparing()
+        send_order_push(order, "Order accepted", f"{order.restaurant.name} is preparing your order.")
         return Response(OwnerOrderSerializer(order).data)
 
 
@@ -674,6 +747,12 @@ class RejectOrderView(APIView):
 
         order.status = Order.STATUS_REJECTED
         order.save(update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"])
+        send_order_push(
+            order, "Order declined",
+            f"{order.restaurant.name} couldn't take this order — your payment is being refunded."
+            if order.payment_status == Order.PAYMENT_REFUNDED
+            else f"{order.restaurant.name} couldn't take this order.",
+        )
         return Response(OwnerOrderSerializer(order).data)
 
 
@@ -691,6 +770,7 @@ class MarkOrderReadyView(APIView):
             )
         order.status = Order.STATUS_READY
         order.save(update_fields=["status", "updated_at"])
+        send_order_push(order, "Ready for pickup!", f"Your order from {order.restaurant.name} is ready — go collect it.")
         return Response(OwnerOrderSerializer(order).data)
 
 

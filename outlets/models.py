@@ -254,3 +254,22 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f"{self.quantity}x {self.name} ({self.order.order_code})"
+
+
+class PushSubscription(models.Model):
+    """A browser's Web Push subscription for one order's status page.
+    Students don't have accounts, so this attaches to the specific order
+    they're tracking (created when they land on order-status.html and
+    grant notification permission) rather than to a user — see
+    send_order_push() in views.py for where these actually get used."""
+
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, related_name="push_subscriptions"
+    )
+    endpoint = models.URLField(max_length=500, unique=True)
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Push subscription for {self.order.order_code}"

@@ -218,6 +218,23 @@ RAZORPAY_KEY_SECRET = env.str("RAZORPAY_KEY_SECRET", default="")
 RAZORPAY_WEBHOOK_SECRET = env.str("RAZORPAY_WEBHOOK_SECRET", default="")
 
 
+# Web Push — lets order-status.html and the dashboard notify a device even
+# when the app/tab isn't open, unlike the plain browser Notification API
+# used elsewhere which only fires while the page is loaded. VAPID_PUBLIC_KEY
+# is safe to expose (it's what the frontend uses to subscribe); the private
+# key must never leave the backend. See outlets/views.py send_order_push().
+VAPID_PUBLIC_KEY = env.str(
+    "VAPID_PUBLIC_KEY",
+    default="BOsXYYIQK2rY1nET_I-NXr-A6ts9_WDH9kEjZYBUC7mGhcfLqRLy3jbXtD3X72WZU1gaAqI_yOz8pO_6FNhhHqo",
+)
+
+# PEM keys are multi-line; stored in .env / Render's env editor as a single
+# line with literal \n escapes (both are single-line-only), unescaped here.
+_vapid_private_key_raw = env.str("VAPID_PRIVATE_KEY", default="")
+VAPID_PRIVATE_KEY = _vapid_private_key_raw.replace("\\n", "\n")
+VAPID_CLAIM_EMAIL = env.str("VAPID_CLAIM_EMAIL", default="mailto:admin@cufood.app")
+
+
 # Production hardening (only applies when DEBUG=False, i.e. on Render)
 
 if not DEBUG:
