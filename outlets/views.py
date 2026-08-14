@@ -25,34 +25,31 @@ from .models import (
     OrderItem,
     PushSubscription,
     Restaurant,
+    RestaurantPushSubscription,
     is_within_business_hours,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def send_order_push(order, title, body):
-    """Best-effort — a student's status page works fine over polling alone
-    (see order-status.js), this is a bonus that fires a real system
-    notification even if they've closed the tab/app. Failures here should
-    never break the actual status transition (accept/reject/ready) that
-    triggered them, so every exception is swallowed after logging.
+def _send_webpush_to(subscriptions, title, body, url, context_label):
+    """Shared send loop for both push flows below — the only difference
+    between a student's per-order subscription and an owner's per-restaurant
+    one is what they're stored against, not how sending/cleanup works.
+    Best-effort: failures here should never break the status transition
+    that triggered them, so every exception is swallowed after logging.
     A 410 Gone means the browser/OS revoked that subscription (uninstalled,
     permission revoked, etc.) — deleting it rather than retrying it forever."""
     if not settings.VAPID_PRIVATE_KEY:
         return
-    for sub in order.push_subscriptions.all():
+    for sub in subscriptions:
         try:
             webpush(
                 subscription_info={
                     "endpoint": sub.endpoint,
                     "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
                 },
-                data=json.dumps({
-                    "title": title,
-                    "body": body,
-                    "url": f"/order-status.html?code={order.order_code}",
-                }),
+                data=json.dumps({"title": title, "body": body, "url": url}),
                 vapid_private_key=settings.VAPID_PRIVATE_KEY,
                 vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
             )
@@ -61,9 +58,31 @@ def send_order_push(order, title, body):
             if status_code == 410:
                 sub.delete()
             else:
-                logger.warning("Push failed for order %s: %s", order.order_code, err)
+                logger.warning("Push failed for %s: %s", context_label, err)
         except Exception:
-            logger.exception("Unexpected error sending push for order %s", order.order_code)
+            logger.exception("Unexpected error sending push for %s", context_label)
+
+
+def send_order_push(order, title, body):
+    """A student's status page works fine over polling alone (see
+    order-status.js) — this is a bonus that fires a real system
+    notification even if they've closed the tab/app."""
+    _send_webpush_to(
+        order.push_subscriptions.all(), title, body,
+        f"/order-status.html?code={order.order_code}", f"order {order.order_code}",
+    )
+
+
+def send_owner_push(restaurant, title, body):
+    """Fired the instant a new order's payment is confirmed (see
+    RazorpayWebhookView) — that's the same moment it first becomes
+    visible/actionable on the dashboard (see MyOrdersView), so a real
+    system notification here means an owner doesn't have to keep the
+    dashboard tab open to know a new order just came in."""
+    _send_webpush_to(
+        restaurant.push_subscriptions.all(), title, body,
+        "/dashboard.html", f"restaurant {restaurant.slug}",
+    )
 
 
 def get_razorpay_client():
@@ -612,6 +631,11 @@ class RazorpayWebhookView(APIView):
             order.save(update_fields=[
                 "payment_status", "razorpay_payment_id", "payment_confirmed_at", "updated_at",
             ])
+            item_summary = ", ".join(f"{item.quantity}x {item.name}" for item in order.items.all())
+            send_owner_push(
+                order.restaurant, "New order!",
+                f"{item_summary} — ₹{order.total_amount}",
+            )
 
         return Response(status=status.HTTP_200_OK)
 
@@ -654,6 +678,37 @@ class SubscribeOrderPushView(APIView):
         PushSubscription.objects.update_or_create(
             endpoint=endpoint,
             defaults={"order": order, "p256dh": p256dh, "auth": auth},
+        )
+        return Response(status=status.HTTP_201_CREATED)
+
+
+class SubscribeOwnerPushView(APIView):
+    """Called from dashboard.js once an owner grants notification
+    permission — stores their browser's Web Push subscription against
+    their restaurant so send_owner_push() (see RazorpayWebhookView) can
+    reach them for every future order, not just while the dashboard tab
+    is open. Authenticated, unlike SubscribeOrderPushView above, since
+    owners actually have accounts to attach this to."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        restaurant = get_owned_restaurant(request.user)
+        if restaurant is None:
+            return Response(
+                {"detail": "No restaurant linked to this account"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        endpoint = request.data.get("endpoint")
+        keys = request.data.get("keys") or {}
+        p256dh = keys.get("p256dh")
+        auth = keys.get("auth")
+        if not endpoint or not p256dh or not auth:
+            return Response({"detail": "Invalid subscription."}, status=status.HTTP_400_BAD_REQUEST)
+
+        RestaurantPushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={"restaurant": restaurant, "p256dh": p256dh, "auth": auth},
         )
         return Response(status=status.HTTP_201_CREATED)
 

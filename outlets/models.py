@@ -273,3 +273,26 @@ class PushSubscription(models.Model):
 
     def __str__(self):
         return f"Push subscription for {self.order.order_code}"
+
+
+class RestaurantPushSubscription(models.Model):
+    """A restaurant owner's Web Push subscription — unlike PushSubscription
+    above, this attaches to the restaurant/account itself (owners do log
+    in, unlike students), so one subscription covers every future order,
+    not just one. Created from the dashboard's "Enable order alerts"
+    button. See send_owner_push() in views.py, fired from
+    RazorpayWebhookView the moment a new order's payment is confirmed —
+    that's the same instant it first becomes visible/actionable to the
+    owner (see MyOrdersView), so "new order" and "you can now act on this"
+    are the same event."""
+
+    restaurant = models.ForeignKey(
+        Restaurant, on_delete=models.CASCADE, related_name="push_subscriptions"
+    )
+    endpoint = models.URLField(max_length=500, unique=True)
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Push subscription for {self.restaurant.name}"

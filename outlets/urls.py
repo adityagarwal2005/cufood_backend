@@ -18,6 +18,7 @@ urlpatterns = [
     ),
     path("me/menu-items/", views.MenuItemCreateView.as_view()),
     path("me/menu-items/<int:item_id>/", views.MenuItemDetailView.as_view()),
+    path("me/restaurant/subscribe/", views.SubscribeOwnerPushView.as_view()),
     path("orders/create/", views.CreateOrderView.as_view()),
     path("orders/<str:order_code>/", views.OrderStatusView.as_view()),
     path("orders/<str:order_code>/retry-payment/", views.RetryPaymentView.as_view()),
