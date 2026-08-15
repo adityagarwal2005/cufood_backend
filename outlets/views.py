@@ -1,11 +1,13 @@
 import json
 import logging
 import re
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 
 import razorpay
 from django.conf import settings
 from django.contrib.auth import authenticate
-from django.db.models import Q
+from django.db.models import F, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -19,6 +21,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from .models import (
+    IST,
     Location,
     MenuItem,
     Order,
@@ -737,6 +740,68 @@ class MyOrdersView(APIView):
             status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING
         ).order_by("-created_at")[:100]
         return Response(OwnerOrderSerializer(orders, many=True).data)
+
+
+class DailySalesView(APIView):
+    """Owner-facing sales breakdown for a single day (IST calendar day,
+    default today). Only counts orders that were actually paid for —
+    payment_status=paid naturally excludes unpaid/expired carts and
+    successfully-refunded rejections, which is why we don't also filter
+    on Order.status here."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        restaurant = get_owned_restaurant(request.user)
+        if restaurant is None:
+            return Response(
+                {"detail": "No restaurant linked to this account"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        date_str = request.query_params.get("date")
+        if date_str:
+            try:
+                target_date = date.fromisoformat(date_str)
+            except ValueError:
+                return Response({"detail": "Invalid date, expected YYYY-MM-DD"}, status=400)
+        else:
+            target_date = timezone.now().astimezone(IST).date()
+
+        day_start = datetime.combine(target_date, time.min, tzinfo=IST)
+        day_end = day_start + timedelta(days=1)
+
+        orders = Order.objects.filter(
+            restaurant=restaurant,
+            payment_status=Order.PAYMENT_PAID,
+            created_at__gte=day_start,
+            created_at__lt=day_end,
+        )
+
+        # revenue must be computed before quantity is aliased below — once an
+        # annotation named "quantity" exists, F("quantity") inside the same
+        # annotate() resolves to that new annotation instead of the field,
+        # which Django rejects (aggregate-of-aggregate).
+        items_qs = (
+            OrderItem.objects.filter(order__in=orders)
+            .values("name")
+            .annotate(revenue=Sum(F("unit_price") * F("quantity")))
+            .annotate(quantity=Sum("quantity"))
+            .order_by("-quantity")
+        )
+        items = list(items_qs)
+
+        total_orders = orders.count()
+        total_revenue = sum((o.total_amount - o.platform_fee for o in orders), Decimal("0.00"))
+        most_ordered = items[0] if items else None
+
+        return Response({
+            "date": target_date.isoformat(),
+            "total_orders": total_orders,
+            "total_revenue": total_revenue,
+            "most_ordered_item": most_ordered,
+            "items": items,
+        })
 
 
 class AcceptOrderView(APIView):
