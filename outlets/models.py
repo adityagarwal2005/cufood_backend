@@ -1,5 +1,6 @@
 import random
 import string
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -193,7 +194,18 @@ class Order(models.Model):
     # self-reported "I've paid" timestamp it replaces.
     payment_confirmed_at = models.DateTimeField(null=True, blank=True)
 
+    # total_amount is the FULL amount actually charged to the student
+    # (menu item subtotal + platform_fee) — that's what gets sent to
+    # Razorpay and refunded in full on reject, since the student paid all
+    # of it. platform_fee is broken out separately so the restaurant's
+    # actual payout (total_amount - platform_fee) can be shown correctly
+    # wherever an owner sees "how much do I owe/get for this order" —
+    # they never see the fee itself, since it's not theirs.
+    # Stored per-order (not looked up from a live constant) so a change to
+    # PLATFORM_FEE later doesn't retroactively alter historical orders.
+    PLATFORM_FEE = Decimal("1.50")
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
+    platform_fee = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
     estimated_ready_minutes = models.PositiveIntegerField(default=12)
     estimated_ready_at = models.DateTimeField(null=True, blank=True)
     # Null means "as soon as possible" — the default and by far the common

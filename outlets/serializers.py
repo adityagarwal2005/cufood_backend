@@ -111,6 +111,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "payment_status",
             "payment_confirmed_at",
             "total_amount",
+            "platform_fee",
             "estimated_ready_minutes",
             "estimated_ready_at",
             "scheduled_for",
@@ -126,5 +127,15 @@ class OwnerOrderSerializer(OrderSerializer):
     student about an issue) — refunds go through Razorpay automatically on
     reject, not via the owner paying the student back themselves."""
 
+    # What the restaurant actually gets — total_amount is what the student
+    # paid, which includes the platform fee that stays with the platform.
+    # Showing that raw total_amount to an owner as "your money" would be
+    # wrong by exactly platform_fee every time, so this is computed here
+    # rather than left for the dashboard to (maybe incorrectly) work out.
+    restaurant_payout = serializers.SerializerMethodField()
+
     class Meta(OrderSerializer.Meta):
-        fields = OrderSerializer.Meta.fields + ["student_phone_number"]
+        fields = OrderSerializer.Meta.fields + ["student_phone_number", "restaurant_payout"]
+
+    def get_restaurant_payout(self, order):
+        return order.total_amount - order.platform_fee

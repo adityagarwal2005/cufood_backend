@@ -457,7 +457,7 @@ class CreateOrderView(APIView):
             )
 
         pending_items = []
-        total_amount = 0
+        subtotal = 0
         for raw_item in raw_items:
             menu_item_id = raw_item.get("menu_item_id")
             quantity = raw_item.get("quantity")
@@ -487,7 +487,7 @@ class CreateOrderView(APIView):
             if error:
                 return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
-            total_amount += unit_price * quantity
+            subtotal += unit_price * quantity
             pending_items.append(
                 OrderItem(
                     menu_item=menu_item,
@@ -498,11 +498,15 @@ class CreateOrderView(APIView):
                 )
             )
 
+        # total_amount is what's actually charged (subtotal + platform fee)
+        # — the restaurant's own payout is total_amount - platform_fee,
+        # computed wherever an owner needs to see it (see OwnerOrderSerializer).
         order = Order.objects.create(
             restaurant=restaurant,
             student_name=student_name,
             student_phone_number=student_phone_number,
-            total_amount=total_amount,
+            total_amount=subtotal + Order.PLATFORM_FEE,
+            platform_fee=Order.PLATFORM_FEE,
             scheduled_for=scheduled_for,
         )
         for item in pending_items:
