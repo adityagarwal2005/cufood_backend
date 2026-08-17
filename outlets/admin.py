@@ -1,6 +1,15 @@
 from django.contrib import admin
 
-from .models import Location, MenuItem, Order, OrderItem, Restaurant
+from .models import Location, MenuItem, Order, OrderItem, Restaurant, StudentProfile
+
+
+@admin.register(StudentProfile)
+class StudentProfileAdmin(admin.ModelAdmin):
+    # The list view's row count/pagination is the "total registered
+    # students" number — no separate analytics page needed for that.
+    list_display = ("user", "created_at")
+    search_fields = ("user__username", "user__email")
+    readonly_fields = ("user", "created_at")
 
 
 @admin.register(Location)
@@ -50,14 +59,14 @@ class OrderAdmin(admin.ModelAdmin):
     list_display = (
         "order_code",
         "restaurant",
-        "student_name",
+        "student",
         "status",
         "payment_status",
         "total_amount",
         "created_at",
     )
     list_filter = ("restaurant", "status", "payment_status")
-    search_fields = ("order_code", "student_name")
+    search_fields = ("order_code", "student_name", "student__username", "student__email")
     readonly_fields = (
         "razorpay_order_id",
         "razorpay_payment_id",

@@ -1,12 +1,19 @@
 import json
 import logging
+import random
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 import razorpay
+import resend
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
+from django.db import IntegrityError
 from django.db.models import F, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -22,6 +29,7 @@ from rest_framework.views import APIView
 
 from .models import (
     IST,
+    EmailOTP,
     Location,
     MenuItem,
     Order,
@@ -29,6 +37,7 @@ from .models import (
     PushSubscription,
     Restaurant,
     RestaurantPushSubscription,
+    StudentProfile,
     is_within_business_hours,
 )
 
@@ -256,11 +265,182 @@ class LoginView(APIView):
 
 
 class LogoutView(APIView):
+    """Shared by both owners and students — logging out is just discarding
+    the bearer token either way, nothing account-type-specific about it."""
+
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         request.user.auth_token.delete()
         return Response({"detail": "Logged out"})
+
+
+def find_student_by_identifier(identifier):
+    """A student logs in with either their username or their email — try
+    both. student_profile__isnull=False keeps this from ever matching a
+    restaurant-owner account that happens to share a username/email."""
+    if not identifier:
+        return None
+    return User.objects.filter(
+        Q(username__iexact=identifier) | Q(email__iexact=identifier),
+        student_profile__isnull=False,
+    ).first()
+
+
+def send_otp_email(email, code):
+    if not settings.RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not configured.")
+    resend.api_key = settings.RESEND_API_KEY
+    resend.Emails.send({
+        "from": settings.OTP_FROM_EMAIL,
+        "to": [email],
+        "subject": f"Your CUFood login code is {code}",
+        "html": (
+            f"<p>Your CUFood login code is <strong>{code}</strong>.</p>"
+            f"<p>It expires in {EmailOTP.OTP_TTL_MINUTES} minutes. "
+            f"If you didn't request this, you can ignore this email.</p>"
+        ),
+    })
+
+
+def student_auth_response(user):
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response({"token": token.key, "username": user.username, "email": user.email})
+
+
+class StudentRegisterView(APIView):
+    """One-time account creation — username + email + password. No email
+    verification step on registration itself (keeps sign-up to a single
+    screen); choosing "log in with a code" later implicitly proves the
+    student actually owns that inbox."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        username = (request.data.get("username") or "").strip()
+        email = (request.data.get("email") or "").strip().lower()
+        password = request.data.get("password") or ""
+
+        if not re.fullmatch(r"[a-zA-Z0-9_.]{3,30}", username):
+            return Response(
+                {"detail": "Username must be 3-30 characters: letters, numbers, underscores, or dots."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            validate_email(email)
+        except DjangoValidationError:
+            return Response({"detail": "Enter a valid email address."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_password(password)
+        except DjangoValidationError as exc:
+            return Response({"detail": " ".join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if User.objects.filter(username__iexact=username).exists():
+            return Response({"detail": "That username is already taken."}, status=status.HTTP_400_BAD_REQUEST)
+        if User.objects.filter(email__iexact=email).exists():
+            return Response({"detail": "An account already exists for that email."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.create_user(username=username, email=email, password=password)
+        except IntegrityError:
+            return Response({"detail": "That username or email is already taken."}, status=status.HTTP_400_BAD_REQUEST)
+        StudentProfile.objects.create(user=user)
+        return student_auth_response(user)
+
+
+class StudentRequestOtpView(APIView):
+    """Sends a 6-digit login code to the account's email — used for both
+    the "email + OTP" and "username + OTP" login modes (identifier can be
+    either; the code always goes to the email on file)."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        identifier = (request.data.get("identifier") or "").strip()
+        user = find_student_by_identifier(identifier)
+        if user is None:
+            return Response({"detail": "No account found for that username or email."}, status=status.HTTP_404_NOT_FOUND)
+
+        code = f"{random.randint(0, 999999):06d}"
+        EmailOTP.objects.create(email=user.email, code=code)
+        try:
+            send_otp_email(user.email, code)
+        except Exception:
+            logger.exception("Failed to send OTP email to %s", user.email)
+            return Response(
+                {"detail": "Could not send the code right now. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        # Doesn't echo back the email — the student already knows which
+        # inbox they're checking, and this avoids confirming account
+        # details for whatever partial identifier they typed.
+        return Response({"detail": "A login code has been sent to your email."})
+
+
+class StudentLoginView(APIView):
+    """Handles all four login modes from one endpoint: identifier is either
+    a username or an email, and exactly one of password/otp is provided."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        identifier = (request.data.get("identifier") or "").strip()
+        password = request.data.get("password")
+        otp = (request.data.get("otp") or "").strip()
+
+        user = find_student_by_identifier(identifier)
+        if user is None:
+            return Response({"detail": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if password:
+            authenticated = authenticate(request, username=user.username, password=password)
+            if authenticated is None:
+                return Response({"detail": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+            return student_auth_response(user)
+
+        if otp:
+            otp_row = (
+                EmailOTP.objects.filter(email=user.email, consumed=False)
+                .order_by("-created_at")
+                .first()
+            )
+            if otp_row is None or otp_row.is_expired or otp_row.attempts >= EmailOTP.MAX_ATTEMPTS:
+                return Response({"detail": "That code has expired. Request a new one."}, status=status.HTTP_401_UNAUTHORIZED)
+            if otp_row.code != otp:
+                otp_row.attempts += 1
+                otp_row.save(update_fields=["attempts"])
+                return Response({"detail": "Incorrect code."}, status=status.HTTP_401_UNAUTHORIZED)
+            otp_row.consumed = True
+            otp_row.save(update_fields=["consumed"])
+            return student_auth_response(user)
+
+        return Response({"detail": "A password or code is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class StudentMeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not hasattr(request.user, "student_profile"):
+            return Response({"detail": "Not a student account."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"username": request.user.username, "email": request.user.email})
+
+
+class StudentOrdersView(APIView):
+    """A logged-in student's own order history — replaces the old
+    localStorage-tracked list of order codes now that orders are tied to
+    a real account instead of a browser."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not hasattr(request.user, "student_profile"):
+            return Response({"detail": "Not a student account."}, status=status.HTTP_404_NOT_FOUND)
+        orders = Order.objects.filter(student=request.user).order_by("-created_at")[:100]
+        return Response(OrderSerializer(orders, many=True).data)
 
 
 class MyRestaurantView(APIView):
@@ -409,29 +589,27 @@ class CreateOrderView(APIView):
     and opens a matching Razorpay Order so the frontend can launch Checkout
     immediately after. Payment itself is confirmed later, server-to-server,
     by RazorpayWebhookView — nothing here or on the student's device marks
-    an order as paid."""
+    an order as paid.
 
+    Requires a logged-in student account (not a restaurant owner) — the
+    order is tied to that account (see Order.student) and student_name is
+    taken from the account's username, not typed fresh every time. No
+    phone number is collected anymore: it was unverified free text anyway,
+    and payment already ties the order to a real phone via Razorpay/UPI."""
+
+    permission_classes = [IsAuthenticated]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
     def post(self, request):
+        if not hasattr(request.user, "student_profile"):
+            return Response({"detail": "Log in as a student to place an order."}, status=status.HTTP_403_FORBIDDEN)
+
         restaurant_slug = request.data.get("restaurant_slug")
-        student_name = (request.data.get("student_name") or "").strip()
-        student_phone_number = (request.data.get("student_phone_number") or "").strip()
         raw_items = request.data.get("items")
 
         if not restaurant_slug:
             return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not student_name:
-            return Response({"detail": "Your name is required."}, status=status.HTTP_400_BAD_REQUEST)
-        # Digits only, 10-13 long — covers a plain 10-digit Indian mobile
-        # number and one with a +91/91 prefix, without being too strict
-        # about exactly how it's formatted.
-        if len(re.sub(r"\D", "", student_phone_number)) not in range(10, 14):
-            return Response(
-                {"detail": "A valid phone number is required, so the restaurant can reach you about your order."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         if not raw_items or not isinstance(raw_items, list):
             return Response({"detail": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -506,8 +684,8 @@ class CreateOrderView(APIView):
         # computed wherever an owner needs to see it (see OwnerOrderSerializer).
         order = Order.objects.create(
             restaurant=restaurant,
-            student_name=student_name,
-            student_phone_number=student_phone_number,
+            student=request.user,
+            student_name=request.user.username,
             total_amount=subtotal + Order.PLATFORM_FEE,
             platform_fee=Order.PLATFORM_FEE,
             scheduled_for=scheduled_for,

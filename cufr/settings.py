@@ -235,6 +235,19 @@ VAPID_PRIVATE_KEY = _vapid_private_key_raw.replace("\\n", "\n")
 VAPID_CLAIM_EMAIL = env.str("VAPID_CLAIM_EMAIL", default="mailto:admin@cufood.app")
 
 
+# Student login-by-OTP — codes are sent by email via Resend rather than SMS,
+# since SMS in India needs TRAI/DLT template registration (real paperwork +
+# fees), which isn't set up yet. See StudentRequestOtpView in outlets/views.py.
+# Empty by default so a missing key fails loudly (an OTP silently not
+# sending is worse than the request erroring) rather than pretending to work.
+RESEND_API_KEY = env.str("RESEND_API_KEY", default="")
+# Resend's own sandbox sender — works with zero setup but only delivers to
+# the email address you signed up to Resend with. Swap to something like
+# "CUFood <noreply@cufood.in>" once cufood.in is verified as a sender
+# domain in the Resend dashboard, so OTPs can go to any student's inbox.
+OTP_FROM_EMAIL = env.str("OTP_FROM_EMAIL", default="CUFood <onboarding@resend.dev>")
+
+
 # Production hardening (only applies when DEBUG=False, i.e. on Render)
 
 if not DEBUG:

@@ -84,6 +84,47 @@ class Restaurant(models.Model):
         return self.name
 
 
+class StudentProfile(models.Model):
+    """Marks a User as a registered student account, as opposed to a
+    restaurant owner (which is just a plain User with an owned Restaurant —
+    see Restaurant.owner). Django's User model already covers
+    username/email/password, so this only needs to exist to distinguish
+    "this account can place orders" from "this account owns a restaurant",
+    and to hold future student-only fields (e.g. a WhatsApp-verified phone
+    number, once that's built)."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="student_profile"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.user.username
+
+
+class EmailOTP(models.Model):
+    """A one-time login code sent to a student's email. Short-lived and
+    single-use — see StudentRequestOtpView (sends) and StudentLoginView
+    (verifies) in views.py. Not tied to a User row directly since it also
+    has to work for the "email + OTP" login mode, where the lookup is by
+    email first."""
+
+    OTP_TTL_MINUTES = 10
+    # Caps wrong-code guesses against one OTP, so a 6-digit code can't just
+    # be brute-forced within its 10-minute window.
+    MAX_ATTEMPTS = 5
+
+    email = models.EmailField()
+    code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    consumed = models.BooleanField(default=False)
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    @property
+    def is_expired(self):
+        return timezone.now() - self.created_at > timezone.timedelta(minutes=self.OTP_TTL_MINUTES)
+
+
 class MenuItem(models.Model):
     restaurant = models.ForeignKey(
         Restaurant, on_delete=models.CASCADE, related_name="menu_items"
@@ -170,11 +211,25 @@ class Order(models.Model):
     order_code = models.CharField(
         max_length=6, unique=True, default=generate_order_code, editable=False
     )
+    # Every order is now placed by a logged-in student account (see
+    # CreateOrderView) — this is that account. student_name is kept in
+    # sync with the account's username at order time rather than removed,
+    # so everything downstream that already reads order.student_name
+    # (owner dashboard, order-status page) didn't need to change when
+    # accounts were added. SET_NULL rather than CASCADE so deleting an
+    # account doesn't erase its order history.
+    student = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="orders",
+    )
     student_name = models.CharField(max_length=100)
-    # Collected at checkout for the restaurant to reach the student directly
-    # if needed (e.g. an issue with the order) — refunds no longer go
-    # through this at all now that Razorpay refunds the original payment
-    # method automatically on reject.
+    # No longer collected at checkout (payment already ties the order to a
+    # real phone via Razorpay/UPI, and an account's username is what the
+    # restaurant verifies against now) — kept on the model, still blank,
+    # only for the handful of pre-accounts orders that have one.
     student_phone_number = models.CharField(max_length=20, blank=True)
 
     status = models.CharField(
