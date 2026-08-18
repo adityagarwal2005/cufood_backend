@@ -67,6 +67,13 @@ class Restaurant(models.Model):
         null=True,
         blank=True,
     )
+    # Per-restaurant escape hatch from the campus-wide 10am-6pm Mon-Fri rule
+    # — for testing/soft-launch only (e.g. placing test orders at night
+    # before a restaurant has gone live for real students). Not exposed on
+    # the owner dashboard on purpose: this is set directly in the database
+    # for a specific restaurant during onboarding/testing, then turned back
+    # off once that restaurant is actually handed to its real owner.
+    bypass_business_hours = models.BooleanField(default=False)
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -77,8 +84,9 @@ class Restaurant(models.Model):
     def is_currently_open(self):
         """What students should see: the owner's manual toggle AND real
         business hours both have to say open. Outside 10am-6pm IST Mon-Fri
-        this is always False, even if an owner left the toggle on."""
-        return self.is_open_today and is_within_business_hours()
+        this is always False, even if an owner left the toggle on —
+        unless bypass_business_hours is set for this specific restaurant."""
+        return self.is_open_today and (self.bypass_business_hours or is_within_business_hours())
 
     def __str__(self):
         return self.name

@@ -617,21 +617,26 @@ class CreateOrderView(APIView):
         if schedule_error:
             return Response({"detail": schedule_error}, status=status.HTTP_400_BAD_REQUEST)
 
+        restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
+
         # Every outlet on campus runs the same real-world hours — this is a
         # campus-wide rule, not a per-restaurant setting, so it's checked
-        # here independent of the restaurant's own is_open_today toggle.
-        if not is_within_business_hours():
-            return Response(
-                {"detail": "Ordering is only available 10 AM – 6 PM, Monday–Friday."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if scheduled_for and not is_within_business_hours(scheduled_for):
-            return Response(
-                {"detail": "That pickup time is outside our 10 AM – 6 PM, Monday–Friday hours."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # independent of the restaurant's own is_open_today toggle. The one
+        # exception is bypass_business_hours, a testing-only escape hatch
+        # set directly in the database for a specific restaurant (see the
+        # field's docstring on the model) — not reachable from the API.
+        if not restaurant.bypass_business_hours:
+            if not is_within_business_hours():
+                return Response(
+                    {"detail": "Ordering is only available 10 AM – 6 PM, Monday–Friday."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if scheduled_for and not is_within_business_hours(scheduled_for):
+                return Response(
+                    {"detail": "That pickup time is outside our 10 AM – 6 PM, Monday–Friday hours."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
         if not restaurant.is_open_today:
             return Response(
                 {"detail": f"{restaurant.name} is closed today."}, status=status.HTTP_400_BAD_REQUEST
