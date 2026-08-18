@@ -275,16 +275,24 @@ class LogoutView(APIView):
         return Response({"detail": "Logged out"})
 
 
-def find_student_by_identifier(identifier):
+def find_student_by_identifier(identifier, include_unverified=False):
     """A student logs in with either their username or their email — try
     both. student_profile__isnull=False keeps this from ever matching a
-    restaurant-owner account that happens to share a username/email."""
+    restaurant-owner account that happens to share a username/email.
+    Unverified accounts (registered but the email code was never entered)
+    are excluded by default — they're not real students yet, so login and
+    "resend a login code" shouldn't be able to find them. The one caller
+    that needs the opposite is finishing registration itself, where the
+    account being looked up *is* the unverified one being verified."""
     if not identifier:
         return None
-    return User.objects.filter(
+    qs = User.objects.filter(
         Q(username__iexact=identifier) | Q(email__iexact=identifier),
         student_profile__isnull=False,
-    ).first()
+    )
+    if not include_unverified:
+        qs = qs.filter(is_active=True)
+    return qs.first()
 
 
 def send_otp_email(email, code):
@@ -309,10 +317,17 @@ def student_auth_response(user):
 
 
 class StudentRegisterView(APIView):
-    """One-time account creation — username + email + password. No email
-    verification step on registration itself (keeps sign-up to a single
-    screen); choosing "log in with a code" later implicitly proves the
-    student actually owns that inbox."""
+    """Step 1 of account creation — username + email + password. Creates
+    the account inactive and emails a verification code rather than
+    logging the student in immediately: without this, anyone could type
+    someone else's email address and the account would just work, with no
+    proof they actually own that inbox. StudentVerifyRegistrationView
+    (step 2) is what actually activates the account and returns a token.
+
+    A previous unverified attempt at the same username/email is deleted
+    first — otherwise someone who registered but never entered the code
+    would permanently squat on that username/email, blocking the real
+    owner (or themselves, retrying) from ever registering it."""
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "login"
@@ -336,17 +351,95 @@ class StudentRegisterView(APIView):
         except DjangoValidationError as exc:
             return Response({"detail": " ".join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
 
+        User.objects.filter(
+            Q(username__iexact=username) | Q(email__iexact=email),
+            student_profile__isnull=False,
+            is_active=False,
+        ).delete()
+
         if User.objects.filter(username__iexact=username).exists():
             return Response({"detail": "That username is already taken."}, status=status.HTTP_400_BAD_REQUEST)
         if User.objects.filter(email__iexact=email).exists():
             return Response({"detail": "An account already exists for that email."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            user = User.objects.create_user(username=username, email=email, password=password)
+            user = User.objects.create_user(username=username, email=email, password=password, is_active=False)
         except IntegrityError:
             return Response({"detail": "That username or email is already taken."}, status=status.HTTP_400_BAD_REQUEST)
         StudentProfile.objects.create(user=user)
+
+        code = f"{random.randint(0, 999999):06d}"
+        EmailOTP.objects.create(email=email, code=code)
+        try:
+            send_otp_email(email, code)
+        except Exception:
+            logger.exception("Failed to send registration OTP email to %s", email)
+            user.delete()
+            return Response(
+                {"detail": "Could not send a verification code right now. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response({"detail": "A verification code has been sent to your email."})
+
+
+class StudentVerifyRegistrationView(APIView):
+    """Step 2 — the code from StudentRegisterView. Activates the account
+    and logs the student in, same as a normal login would."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        identifier = (request.data.get("identifier") or "").strip()
+        otp = (request.data.get("otp") or "").strip()
+
+        user = find_student_by_identifier(identifier, include_unverified=True)
+        if user is None or user.is_active:
+            return Response({"detail": "Invalid or already-verified account."}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_row = (
+            EmailOTP.objects.filter(email=user.email, consumed=False)
+            .order_by("-created_at")
+            .first()
+        )
+        if otp_row is None or otp_row.is_expired or otp_row.attempts >= EmailOTP.MAX_ATTEMPTS:
+            return Response({"detail": "That code has expired. Request a new one."}, status=status.HTTP_400_BAD_REQUEST)
+        if otp_row.code != otp:
+            otp_row.attempts += 1
+            otp_row.save(update_fields=["attempts"])
+            return Response({"detail": "Incorrect code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_row.consumed = True
+        otp_row.save(update_fields=["consumed"])
+        user.is_active = True
+        user.save(update_fields=["is_active"])
         return student_auth_response(user)
+
+
+class StudentResendRegistrationOtpView(APIView):
+    """Resend the verification code for an account still stuck at step 1
+    (e.g. the first email got lost, or the code expired)."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        identifier = (request.data.get("identifier") or "").strip()
+        user = find_student_by_identifier(identifier, include_unverified=True)
+        if user is None or user.is_active:
+            return Response({"detail": "Invalid or already-verified account."}, status=status.HTTP_400_BAD_REQUEST)
+
+        code = f"{random.randint(0, 999999):06d}"
+        EmailOTP.objects.create(email=user.email, code=code)
+        try:
+            send_otp_email(user.email, code)
+        except Exception:
+            logger.exception("Failed to resend registration OTP email to %s", user.email)
+            return Response(
+                {"detail": "Could not send the code right now. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response({"detail": "A new verification code has been sent to your email."})
 
 
 class StudentRequestOtpView(APIView):

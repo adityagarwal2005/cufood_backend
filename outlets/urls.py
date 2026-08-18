@@ -10,6 +10,8 @@ urlpatterns = [
     path("login/", views.LoginView.as_view()),
     path("logout/", views.LogoutView.as_view()),
     path("students/register/", views.StudentRegisterView.as_view()),
+    path("students/verify-registration/", views.StudentVerifyRegistrationView.as_view()),
+    path("students/resend-registration-otp/", views.StudentResendRegistrationOtpView.as_view()),
     path("students/login/", views.StudentLoginView.as_view()),
     path("students/request-otp/", views.StudentRequestOtpView.as_view()),
     path("students/me/", views.StudentMeView.as_view()),
