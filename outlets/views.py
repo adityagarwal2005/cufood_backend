@@ -14,7 +14,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError
-from django.db.models import F, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -1077,6 +1077,125 @@ class DailySalesView(APIView):
             "total_revenue": total_revenue,
             "most_ordered_item": most_ordered,
             "items": items,
+        })
+
+
+class AdminLoginView(APIView):
+    """Login for the platform-wide admin analytics view — a Django
+    superuser only, completely separate from student accounts and
+    restaurant owner accounts (an owner token or student token both fail
+    AdminStatsView's is_superuser check below, regardless of how they got
+    it). Accepts username or email, same as student login, since there's
+    no reason a superuser should have to remember which one they used."""
+
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
+
+    def post(self, request):
+        identifier = (request.data.get("identifier") or "").strip()
+        password = request.data.get("password") or ""
+
+        user = User.objects.filter(
+            Q(username__iexact=identifier) | Q(email__iexact=identifier),
+            is_superuser=True,
+        ).first()
+        if user is None:
+            return Response({"detail": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        authenticated = authenticate(request, username=user.username, password=password)
+        if authenticated is None:
+            return Response({"detail": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({"token": token.key, "username": user.username})
+
+
+class AdminStatsView(APIView):
+    """Platform-wide analytics for one person: you. Total registered
+    students, order/sales figures for today/yesterday/all-time, total
+    refunds, and a per-restaurant + per-location breakdown for one
+    selected day (defaults to today). "platform_revenue" here is the
+    platform_fee actually collected — there's no restaurant commission
+    deducted anywhere in the codebase yet, so this doesn't (and can't yet)
+    include a commission figure; once that's built, it plugs into this
+    same field."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            return Response({"detail": "Not authorized."}, status=status.HTTP_403_FORBIDDEN)
+
+        date_str = request.query_params.get("date")
+        if date_str:
+            try:
+                target_date = date.fromisoformat(date_str)
+            except ValueError:
+                return Response({"detail": "Invalid date, expected YYYY-MM-DD"}, status=400)
+        else:
+            target_date = timezone.now().astimezone(IST).date()
+
+        def day_bounds(d):
+            start = datetime.combine(d, time.min, tzinfo=IST)
+            return start, start + timedelta(days=1)
+
+        today_start, today_end = day_bounds(target_date)
+        yesterday_start, yesterday_end = day_bounds(target_date - timedelta(days=1))
+
+        paid_orders = Order.objects.filter(payment_status=Order.PAYMENT_PAID)
+        refunded_orders = Order.objects.filter(payment_status=Order.PAYMENT_REFUNDED)
+
+        def summarize(qs):
+            agg = qs.aggregate(
+                count=Count("id"), total_amount=Sum("total_amount"), platform_fee=Sum("platform_fee")
+            )
+            return {
+                "orders": agg["count"] or 0,
+                "total_sales": agg["total_amount"] or Decimal("0.00"),
+                "platform_revenue": agg["platform_fee"] or Decimal("0.00"),
+            }
+
+        today_orders = paid_orders.filter(created_at__gte=today_start, created_at__lt=today_end)
+        yesterday_orders = paid_orders.filter(created_at__gte=yesterday_start, created_at__lt=yesterday_end)
+
+        refund_agg = refunded_orders.aggregate(count=Count("id"), amount=Sum("total_amount"))
+
+        by_restaurant = [
+            {
+                "restaurant_name": row["restaurant__name"],
+                "location_name": row["restaurant__location__name"],
+                "orders": row["orders"],
+                "total_sales": row["total_sales"],
+                "platform_revenue": row["platform_revenue"],
+            }
+            for row in (
+                today_orders.values("restaurant__name", "restaurant__location__name")
+                .annotate(orders=Count("id"), total_sales=Sum("total_amount"), platform_revenue=Sum("platform_fee"))
+                .order_by("-total_sales")
+            )
+        ]
+
+        by_location = [
+            {"location_name": row["restaurant__location__name"], "orders": row["orders"], "total_sales": row["total_sales"]}
+            for row in (
+                today_orders.values("restaurant__location__name")
+                .annotate(orders=Count("id"), total_sales=Sum("total_amount"))
+                .order_by("-total_sales")
+            )
+        ]
+
+        return Response({
+            "date": target_date.isoformat(),
+            "total_registered_students": StudentProfile.objects.count(),
+            "today": summarize(today_orders),
+            "yesterday": summarize(yesterday_orders),
+            "all_time": summarize(paid_orders),
+            "refunds": {
+                "count": refund_agg["count"] or 0,
+                "total_amount": refund_agg["amount"] or Decimal("0.00"),
+            },
+            "by_restaurant": by_restaurant,
+            "by_location": by_location,
         })
 
 
