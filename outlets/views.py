@@ -309,6 +309,10 @@ def send_order_confirmation_email(order):
         f" &mdash; ₹{item.unit_price * item.quantity}</li>"
         for item in order.items.all()
     )
+    instructions_html = (
+        f"<p><strong>Note:</strong> {escape(order.special_instructions)}</p>"
+        if order.special_instructions else ""
+    )
     resend.api_key = settings.RESEND_API_KEY
     try:
         resend.Emails.send({
@@ -319,6 +323,7 @@ def send_order_confirmation_email(order):
                 f"<p>Thank you for ordering from <strong>{escape(order.restaurant.name)}</strong>!</p>"
                 f"<p>Order <strong>#{order.order_code}</strong>:</p>"
                 f"<ul>{items_html}</ul>"
+                f"{instructions_html}"
                 f"<p><strong>Total: ₹{order.total_amount}</strong></p>"
                 f'<p><a href="https://www.cufood.in/order-status.html?code={order.order_code}">'
                 f"Track your order</a></p>"
@@ -733,6 +738,7 @@ class CreateOrderView(APIView):
 
         restaurant_slug = request.data.get("restaurant_slug")
         raw_items = request.data.get("items")
+        special_instructions = (request.data.get("special_instructions") or "").strip()[:300]
 
         if not restaurant_slug:
             return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -817,6 +823,7 @@ class CreateOrderView(APIView):
             restaurant=restaurant,
             student=request.user,
             student_name=request.user.username,
+            special_instructions=special_instructions,
             total_amount=subtotal + Order.PLATFORM_FEE,
             platform_fee=Order.PLATFORM_FEE,
             scheduled_for=scheduled_for,

@@ -107,6 +107,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "restaurant_name",
             "restaurant_slug",
             "student_name",
+            "special_instructions",
             "status",
             "payment_status",
             "payment_confirmed_at",

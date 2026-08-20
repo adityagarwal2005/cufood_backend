@@ -239,6 +239,10 @@ class Order(models.Model):
     # restaurant verifies against now) — kept on the model, still blank,
     # only for the handful of pre-accounts orders that have one.
     student_phone_number = models.CharField(max_length=20, blank=True)
+    # Optional free text from the student at checkout (e.g. "no sugar",
+    # "extra spicy") — shown to the restaurant on their order card. Never
+    # required, never validated beyond a length cap.
+    special_instructions = models.CharField(max_length=300, blank=True)
 
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PLACED
