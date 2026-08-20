@@ -18,6 +18,7 @@ from django.db.models import Count, F, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from django.utils.html import escape
 from pywebpush import WebPushException, webpush
 from rest_framework import status
 from rest_framework.authtoken.models import Token
@@ -293,6 +294,38 @@ def find_student_by_identifier(identifier, include_unverified=False):
     if not include_unverified:
         qs = qs.filter(is_active=True)
     return qs.first()
+
+
+def send_order_confirmation_email(order):
+    """Best-effort — never blocks the payment-confirmation flow that
+    triggers it (see RazorpayWebhookView). A missing/failed send here
+    just means the student doesn't get a receipt in their inbox; the
+    order itself is already correctly marked paid either way."""
+    if not settings.RESEND_API_KEY or not order.student or not order.student.email:
+        return
+    items_html = "".join(
+        f"<li>{item.quantity}x {escape(item.name)}"
+        f"{f' ({escape(item.size_label)})' if item.size_label else ''}"
+        f" &mdash; ₹{item.unit_price * item.quantity}</li>"
+        for item in order.items.all()
+    )
+    resend.api_key = settings.RESEND_API_KEY
+    try:
+        resend.Emails.send({
+            "from": settings.OTP_FROM_EMAIL,
+            "to": [order.student.email],
+            "subject": f"Thanks for your order at {order.restaurant.name}! (#{order.order_code})",
+            "html": (
+                f"<p>Thank you for ordering from <strong>{escape(order.restaurant.name)}</strong>!</p>"
+                f"<p>Order <strong>#{order.order_code}</strong>:</p>"
+                f"<ul>{items_html}</ul>"
+                f"<p><strong>Total: ₹{order.total_amount}</strong></p>"
+                f'<p><a href="https://www.cufood.in/order-status.html?code={order.order_code}">'
+                f"Track your order</a></p>"
+            ),
+        })
+    except Exception:
+        logger.exception("Failed to send order confirmation email for %s", order.order_code)
 
 
 def send_otp_email(email, code):
@@ -919,6 +952,7 @@ class RazorpayWebhookView(APIView):
                 order.restaurant, "New order!",
                 f"{item_summary} — ₹{order.total_amount}",
             )
+            send_order_confirmation_email(order)
 
         return Response(status=status.HTTP_200_OK)
 
