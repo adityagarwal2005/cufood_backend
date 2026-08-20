@@ -1,10 +1,11 @@
 name: Keep backend awake
 
-# Render's free tier spins the service down after a period of no traffic,
-# and the next request has to cold-start it — which is what was causing
-# UptimeRobot's checks to intermittently 500 (multiple regions hitting it
-# at once while it's mid-boot). A ping well inside Render's idle timeout
-# keeps it warm so that never happens.
+# Cloud Run's free tier (min-instances=0) scales the service down to zero
+# after a period of no traffic, and the next request has to cold-start a
+# fresh container — same underlying tradeoff Render's free tier had, just
+# on a different platform now that the backend moved off Render (see
+# git log). A ping well inside Cloud Run's idle window keeps at least one
+# instance warm so real requests never eat that cold-start delay.
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -15,4 +16,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping backend
-        run: curl -sf --max-time 30 https://cufood-backend.onrender.com/api/locations/ > /dev/null
+        run: curl -sf --max-time 30 https://cufood-backend-832534179056.asia-south1.run.app/api/locations/ > /dev/null
