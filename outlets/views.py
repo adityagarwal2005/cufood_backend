@@ -739,6 +739,11 @@ class CreateOrderView(APIView):
         restaurant_slug = request.data.get("restaurant_slug")
         raw_items = request.data.get("items")
         special_instructions = (request.data.get("special_instructions") or "").strip()[:300]
+        # A per-order display name, editable at checkout — cosmetic only,
+        # never the account's actual identity (Order.student below is
+        # always the real, logged-in account regardless of what's typed
+        # here). Falls back to the account's username if left blank.
+        student_name = (request.data.get("student_name") or "").strip()[:100] or request.user.username
 
         if not restaurant_slug:
             return Response({"detail": "restaurant_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -822,7 +827,7 @@ class CreateOrderView(APIView):
         order = Order.objects.create(
             restaurant=restaurant,
             student=request.user,
-            student_name=request.user.username,
+            student_name=student_name,
             special_instructions=special_instructions,
             total_amount=subtotal + Order.PLATFORM_FEE,
             platform_fee=Order.PLATFORM_FEE,
