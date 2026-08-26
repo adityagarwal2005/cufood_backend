@@ -296,6 +296,67 @@ def find_student_by_identifier(identifier, include_unverified=False):
     return qs.first()
 
 
+SITE_URL = "https://www.cufood.in"
+
+
+def render_branded_email(body_html):
+    """Wraps an email body in the CUFood header/footer. Table-based and
+    inline-styled on purpose — email clients (Gmail especially) strip
+    <style> blocks and ignore most modern CSS, so anything that isn't
+    inline on the element won't survive. The logo is a pre-composited
+    PNG with the dark background baked in rather than a transparent one
+    on a coloured cell: the wordmark's "CU" is white, so on a client that
+    drops background colours it would otherwise render invisible."""
+    return (
+        '<div style="margin:0;padding:24px 12px;background:#f4f4f4;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"'
+        ' style="max-width:520px;width:100%;margin:0 auto;border-collapse:collapse;'
+        'background:#ffffff;border-radius:16px;overflow:hidden;'
+        'font-family:Helvetica,Arial,sans-serif;">'
+        '<tr><td align="center" bgcolor="#060605" style="background:#060605;padding:20px 0;">'
+        f'<img src="{SITE_URL}/logo-email.png" width="200" alt="CUFood"'
+        ' style="display:block;border:0;outline:none;text-decoration:none;width:200px;height:auto;">'
+        '</td></tr>'
+        f'<tr><td style="padding:28px 28px 24px;color:#0a0a0a;font-size:15px;line-height:1.6;">{body_html}</td></tr>'
+        '<tr><td style="padding:16px 28px 24px;border-top:1px solid #e6e6e6;'
+        'color:#6b6b6b;font-size:12px;line-height:1.5;">'
+        'CUFood &middot; CU Campus<br>'
+        'You\'re getting this because you placed an order on CUFood.'
+        '</td></tr>'
+        '</table></div>'
+    )
+
+
+def email_button(href, label):
+    return (
+        f'<a href="{href}" style="display:inline-block;background:#d9531e;color:#ffffff;'
+        'text-decoration:none;font-weight:bold;font-size:14px;padding:12px 22px;'
+        f'border-radius:999px;">{label}</a>'
+    )
+
+
+def order_items_table(order):
+    rows = "".join(
+        '<tr>'
+        f'<td style="padding:6px 0;color:#0a0a0a;font-size:14px;">{item.quantity}&times; {escape(item.name)}'
+        f'{f" ({escape(item.size_label)})" if item.size_label else ""}</td>'
+        f'<td align="right" style="padding:6px 0;color:#6b6b6b;font-size:14px;">'
+        f'&#8377;{item.unit_price * item.quantity}</td>'
+        '</tr>'
+        for item in order.items.all()
+    )
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"'
+        ' style="border-collapse:collapse;margin:8px 0 4px;">'
+        f'{rows}'
+        '<tr><td style="padding:10px 0 0;border-top:1px solid #e6e6e6;font-size:14px;'
+        '"><strong>Total</strong></td>'
+        '<td align="right" style="padding:10px 0 0;border-top:1px solid #e6e6e6;font-size:14px;">'
+        f'<strong>&#8377;{order.total_amount}</strong></td></tr>'
+        '</table>'
+    )
+
+
 def send_order_confirmation_email(order):
     """Best-effort — never blocks the payment-confirmation flow that
     triggers it (see RazorpayWebhookView). A missing/failed send here
@@ -303,34 +364,78 @@ def send_order_confirmation_email(order):
     order itself is already correctly marked paid either way."""
     if not settings.RESEND_API_KEY or not order.student or not order.student.email:
         return
-    items_html = "".join(
-        f"<li>{item.quantity}x {escape(item.name)}"
-        f"{f' ({escape(item.size_label)})' if item.size_label else ''}"
-        f" &mdash; ₹{item.unit_price * item.quantity}</li>"
-        for item in order.items.all()
-    )
     instructions_html = (
-        f"<p><strong>Note:</strong> {escape(order.special_instructions)}</p>"
+        f'<p style="margin:14px 0 0;color:#6b6b6b;font-size:14px;">'
+        f'<strong style="color:#0a0a0a;">Your note:</strong> {escape(order.special_instructions)}</p>'
         if order.special_instructions else ""
+    )
+    body = (
+        '<p style="margin:0 0 6px;font-size:20px;font-weight:bold;">Order placed &#127881;</p>'
+        f'<p style="margin:0 0 20px;color:#6b6b6b;">Thanks for ordering from '
+        f'<strong style="color:#0a0a0a;">{escape(order.restaurant.name)}</strong>. '
+        'We\'ll let you know as soon as it\'s being prepared.</p>'
+        '<p style="margin:0 0 4px;color:#6b6b6b;font-size:13px;">Pickup code</p>'
+        f'<p style="margin:0 0 18px;font-size:26px;font-weight:bold;letter-spacing:4px;">'
+        f'{escape(order.order_code)}</p>'
+        f'{order_items_table(order)}'
+        f'{instructions_html}'
+        f'<p style="margin:22px 0 0;">'
+        f'{email_button(f"{SITE_URL}/order-status.html?code={order.order_code}", "Track your order")}</p>'
     )
     resend.api_key = settings.RESEND_API_KEY
     try:
         resend.Emails.send({
             "from": settings.OTP_FROM_EMAIL,
             "to": [order.student.email],
-            "subject": f"Thanks for your order at {order.restaurant.name}! (#{order.order_code})",
-            "html": (
-                f"<p>Thank you for ordering from <strong>{escape(order.restaurant.name)}</strong>!</p>"
-                f"<p>Order <strong>#{order.order_code}</strong>:</p>"
-                f"<ul>{items_html}</ul>"
-                f"{instructions_html}"
-                f"<p><strong>Total: ₹{order.total_amount}</strong></p>"
-                f'<p><a href="https://www.cufood.in/order-status.html?code={order.order_code}">'
-                f"Track your order</a></p>"
-            ),
+            "subject": f"Order placed at {order.restaurant.name} (#{order.order_code})",
+            "html": render_branded_email(body),
         })
     except Exception:
         logger.exception("Failed to send order confirmation email for %s", order.order_code)
+
+
+def send_order_rejected_email(order, refunded):
+    """Sent when an outlet declines an order (see RejectOrderView). The
+    refund wording is driven by whether the Razorpay refund actually went
+    through, not by the rejection alone — promising money back in an
+    email when the refund call failed would be a lie the student acts on."""
+    if not settings.RESEND_API_KEY or not order.student or not order.student.email:
+        return
+    if refunded:
+        money_html = (
+            '<p style="margin:0 0 18px;color:#6b6b6b;">'
+            f'We\'ve already sent your <strong style="color:#0a0a0a;">&#8377;{order.total_amount}</strong> '
+            'back to the way you paid. It usually lands within a few minutes, though your bank can '
+            'occasionally take a little longer.</p>'
+        )
+    else:
+        money_html = (
+            '<p style="margin:0 0 18px;color:#6b6b6b;">'
+            'No payment was taken for this order, so there\'s nothing to refund.</p>'
+        )
+    body = (
+        '<p style="margin:0 0 6px;font-size:20px;font-weight:bold;">Your order was declined</p>'
+        f'<p style="margin:0 0 16px;color:#6b6b6b;">Sorry &mdash; '
+        f'<strong style="color:#0a0a0a;">{escape(order.restaurant.name)}</strong> '
+        f'couldn\'t take order <strong style="color:#0a0a0a;">#{escape(order.order_code)}</strong>. '
+        'This usually means they\'ve run out of something or are too busy right now.</p>'
+        f'{money_html}'
+        f'{order_items_table(order)}'
+        f'<p style="margin:22px 0 0;">'
+        f'{email_button(f"{SITE_URL}/location-select.html", "Order something else")}</p>'
+    )
+    resend.api_key = settings.RESEND_API_KEY
+    try:
+        resend.Emails.send({
+            "from": settings.OTP_FROM_EMAIL,
+            "to": [order.student.email],
+            "subject": f"Order #{order.order_code} was declined — refund on its way"
+            if refunded
+            else f"Order #{order.order_code} was declined",
+            "html": render_branded_email(body),
+        })
+    except Exception:
+        logger.exception("Failed to send rejection email for %s", order.order_code)
 
 
 def send_otp_email(email, code):
@@ -1337,12 +1442,14 @@ class RejectOrderView(APIView):
 
         order.status = Order.STATUS_REJECTED
         order.save(update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"])
+        refunded = order.payment_status == Order.PAYMENT_REFUNDED
         send_order_push(
             order, "Order declined",
             f"{order.restaurant.name} couldn't take this order — your payment is being refunded."
-            if order.payment_status == Order.PAYMENT_REFUNDED
+            if refunded
             else f"{order.restaurant.name} couldn't take this order.",
         )
+        send_order_rejected_email(order, refunded)
         return Response(OwnerOrderSerializer(order).data)
 
 
