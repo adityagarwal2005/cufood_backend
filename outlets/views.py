@@ -1121,13 +1121,18 @@ class RazorpayCallbackView(APIView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "orders"
 
-    def _redirect(self, order_code):
+    def _redirect(self, order_code, failed=False):
         if not order_code:
             # No idea which order this was about — the orders list still
             # gets them to the right place, rather than a dead end.
             return HttpResponseRedirect(f"{SITE_URL}/my-orders.html")
+        # payment=failed is a hint for the status page, not a state: it
+        # says "Razorpay told us this attempt failed", so the page can say
+        # so immediately instead of spinning until it infers it from age.
+        # Nothing about the order's real payment_status depends on it.
+        suffix = "&payment=failed" if failed else ""
         return HttpResponseRedirect(
-            f"{SITE_URL}/order-status.html?code={quote(order_code)}"
+            f"{SITE_URL}/order-status.html?code={quote(order_code)}{suffix}"
         )
 
     def post(self, request):
@@ -1142,7 +1147,7 @@ class RazorpayCallbackView(APIView):
             order = Order.objects.filter(
                 razorpay_order_id=self._order_id_from_error(request)
             ).first()
-            return self._redirect(order.order_code if order else None)
+            return self._redirect(order.order_code if order else None, failed=True)
 
         order = Order.objects.filter(razorpay_order_id=razorpay_order_id).first()
         if order is None:
