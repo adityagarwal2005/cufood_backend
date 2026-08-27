@@ -1422,13 +1422,27 @@ class RejectOrderView(APIView):
                 # first settlement clears) versus assuming the app is
                 # broken and hammering "try again."
                 razorpay_detail = None
-                response_body = getattr(exc, "http_body", None) or getattr(exc, "message", None)
+                response_body = getattr(exc, "http_body", None)
                 if isinstance(response_body, (str, bytes)):
                     try:
                         parsed = json.loads(response_body)
                         razorpay_detail = parsed.get("error", {}).get("description")
                     except (ValueError, AttributeError):
                         razorpay_detail = None
+                # The Python SDK doesn't attach http_body — it raises its own
+                # error types with Razorpay's description as the sole argument
+                # (e.g. "Your account does not have enough balance to carry
+                # out the refund operation"). Only trust str(exc) for those
+                # types; a network/timeout traceback is not owner-readable.
+                if not razorpay_detail and isinstance(
+                    exc,
+                    (
+                        razorpay.errors.BadRequestError,
+                        razorpay.errors.GatewayError,
+                        razorpay.errors.ServerError,
+                    ),
+                ):
+                    razorpay_detail = str(exc) or None
                 detail = (
                     f"Refund failed: {razorpay_detail}"
                     if razorpay_detail
