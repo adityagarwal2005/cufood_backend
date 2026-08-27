@@ -4,6 +4,7 @@ import random
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from urllib.parse import quote
 
 import razorpay
 import resend
@@ -15,6 +16,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError
 from django.db.models import Count, F, Q, Sum
+from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -1006,6 +1008,47 @@ class RetryPaymentView(APIView):
         })
 
 
+def mark_order_paid(order, razorpay_payment_id):
+    """The single place an order becomes PAID. Two independent things can
+    report a successful payment — Razorpay's server-to-server webhook and
+    the redirect-mode callback the student's own browser is bounced
+    through (see RazorpayCallbackView) — and in the app flow both usually
+    fire for the same payment. Whichever arrives first wins; the second is
+    a no-op, so the restaurant is never pushed the same order twice and
+    the student never gets two confirmation emails.
+
+    EXPIRED is accepted alongside PENDING on purpose: expire_if_stale()
+    is a UI guard, never a claim that no payment could still land. Returns
+    True only if this call is the one that made the transition."""
+    if order.payment_status not in (Order.PAYMENT_PENDING, Order.PAYMENT_EXPIRED):
+        return False
+
+    # Guards against two callers racing on the same order (webhook and
+    # callback landing together): the UPDATE only matches while the row is
+    # still un-paid, so exactly one of them gets a non-zero rowcount and
+    # goes on to send the notifications.
+    claimed = Order.objects.filter(
+        pk=order.pk,
+        payment_status__in=(Order.PAYMENT_PENDING, Order.PAYMENT_EXPIRED),
+    ).update(
+        payment_status=Order.PAYMENT_PAID,
+        razorpay_payment_id=razorpay_payment_id,
+        payment_confirmed_at=timezone.now(),
+        updated_at=timezone.now(),
+    )
+    if not claimed:
+        return False
+
+    order.refresh_from_db()
+    item_summary = ", ".join(f"{item.quantity}x {item.name}" for item in order.items.all())
+    send_owner_push(
+        order.restaurant, "New order!",
+        f"{item_summary} — ₹{order.total_amount}",
+    )
+    send_order_confirmation_email(order)
+    return True
+
+
 class RazorpayWebhookView(APIView):
     """Public, unauthenticated — but not unverified. Razorpay's servers
     call this directly the moment a payment actually succeeds, independent
@@ -1049,29 +1092,94 @@ class RazorpayWebhookView(APIView):
             logger.warning("Razorpay webhook for unknown order_id=%s", razorpay_order_id)
             return Response(status=status.HTTP_200_OK)
 
-        # Idempotent: Razorpay can and does redeliver webhooks. Only ever
-        # transition into paid once; a redelivery after that is a no-op,
-        # not a re-processing. EXPIRED is included alongside PENDING here
-        # on purpose — expire_if_stale() only stops the app from showing a
-        # stale checkout, it's never a claim that no payment could still
-        # land. If one genuinely did (this webhook firing proves it), that
-        # takes priority over the lazy expiry every time; real money moving
-        # always wins over a UI-only status.
-        if order.payment_status in (Order.PAYMENT_PENDING, Order.PAYMENT_EXPIRED):
-            order.payment_status = Order.PAYMENT_PAID
-            order.razorpay_payment_id = razorpay_payment_id
-            order.payment_confirmed_at = timezone.now()
-            order.save(update_fields=[
-                "payment_status", "razorpay_payment_id", "payment_confirmed_at", "updated_at",
-            ])
-            item_summary = ", ".join(f"{item.quantity}x {item.name}" for item in order.items.all())
-            send_owner_push(
-                order.restaurant, "New order!",
-                f"{item_summary} — ₹{order.total_amount}",
-            )
-            send_order_confirmation_email(order)
+        # Razorpay can and does redeliver webhooks; mark_order_paid is
+        # idempotent, so a redelivery is a no-op rather than a reprocess.
+        mark_order_paid(order, razorpay_payment_id)
 
         return Response(status=status.HTTP_200_OK)
+
+
+class RazorpayCallbackView(APIView):
+    """Where Razorpay sends the student's browser back to after a payment
+    made in redirect mode — which is what the Android app uses instead of
+    Checkout's handler callback (see openRazorpayCheckout in checkout.js).
+
+    Inside the app, paying by UPI hands control to PhonePe/GPay/Paytm.
+    Coming back, the page that opened Checkout may have been torn down, so
+    handler/ondismiss can't be relied on to run at all; that's what left
+    students on 'Waiting for payment' after they'd actually paid. Redirect
+    mode doesn't need the original JS context to survive — Razorpay POSTs
+    the result here and we bounce the browser to the status page.
+
+    Unauthenticated by necessity (this is a cross-origin form POST from
+    Razorpay's domain, carrying no session or token). The signature check
+    is what makes it trustworthy, exactly as in RazorpayWebhookView — a
+    forged POST without a valid signature marks nothing as paid."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "orders"
+
+    def _redirect(self, order_code):
+        if not order_code:
+            # No idea which order this was about — the orders list still
+            # gets them to the right place, rather than a dead end.
+            return HttpResponseRedirect(f"{SITE_URL}/my-orders.html")
+        return HttpResponseRedirect(
+            f"{SITE_URL}/order-status.html?code={quote(order_code)}"
+        )
+
+    def post(self, request):
+        razorpay_order_id = request.data.get("razorpay_order_id") or ""
+        razorpay_payment_id = request.data.get("razorpay_payment_id") or ""
+        razorpay_signature = request.data.get("razorpay_signature") or ""
+
+        # A failed/cancelled payment posts an error object instead of the
+        # three success fields. Nothing to verify or mark — just put the
+        # student back on their order, where the retry button lives.
+        if not (razorpay_order_id and razorpay_payment_id and razorpay_signature):
+            order = Order.objects.filter(
+                razorpay_order_id=self._order_id_from_error(request)
+            ).first()
+            return self._redirect(order.order_code if order else None)
+
+        order = Order.objects.filter(razorpay_order_id=razorpay_order_id).first()
+        if order is None:
+            logger.warning("Razorpay callback for unknown order_id=%s", razorpay_order_id)
+            return self._redirect(None)
+
+        try:
+            get_razorpay_client().utility.verify_payment_signature({
+                "razorpay_order_id": razorpay_order_id,
+                "razorpay_payment_id": razorpay_payment_id,
+                "razorpay_signature": razorpay_signature,
+            })
+        except razorpay.errors.SignatureVerificationError:
+            # Deliberately not marked paid. If the payment was genuine the
+            # webhook still confirms it independently, so a student is
+            # never stranded by this branch alone.
+            logger.warning("Razorpay callback signature failed for %s", order.order_code)
+            return self._redirect(order.order_code)
+
+        mark_order_paid(order, razorpay_payment_id)
+        return self._redirect(order.order_code)
+
+    @staticmethod
+    def _order_id_from_error(request):
+        """On failure Razorpay sends an error object instead of the three
+        success fields. It arrives as a flattened form POST
+        ("error[metadata][order_id]"), but tolerate a real nested dict too
+        rather than depending on which encoding shows up."""
+        flat = request.data.get("error[metadata][order_id]")
+        if flat:
+            return flat
+        error = request.data.get("error")
+        if isinstance(error, dict):
+            metadata = error.get("metadata")
+            if isinstance(metadata, dict):
+                return metadata.get("order_id")
+        return None
 
 
 class OrderStatusView(APIView):

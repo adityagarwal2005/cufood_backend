@@ -31,6 +31,7 @@ urlpatterns = [
     path("orders/<str:order_code>/retry-payment/", views.RetryPaymentView.as_view()),
     path("orders/<str:order_code>/subscribe/", views.SubscribeOrderPushView.as_view()),
     path("webhooks/razorpay/", views.RazorpayWebhookView.as_view()),
+    path("payments/callback/", views.RazorpayCallbackView.as_view()),
     path("me/orders/", views.MyOrdersView.as_view()),
     path("me/orders/daily-sales/", views.DailySalesView.as_view()),
     path("admin/login/", views.AdminLoginView.as_view()),
