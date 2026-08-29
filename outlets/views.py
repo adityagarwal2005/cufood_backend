@@ -1,6 +1,6 @@
 import json
 import logging
-import random
+import secrets
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -278,6 +278,18 @@ class LogoutView(APIView):
         return Response({"detail": "Logged out"})
 
 
+def generate_otp_code():
+    """6-digit code for email verification and OTP login.
+
+    secrets rather than random for the same reason as generate_order_code:
+    this is an authentication credential. random's Mersenne Twister state
+    can be reconstructed from enough observed output, and an attacker can
+    produce observations on demand by requesting codes for an address they
+    control — which is exactly what would let them predict the code emailed
+    to somebody else."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
 def find_student_by_identifier(identifier, include_unverified=False):
     """A student logs in with either their username or their email — try
     both. student_profile__isnull=False keeps this from ever matching a
@@ -513,7 +525,7 @@ class StudentRegisterView(APIView):
             return Response({"detail": "That username or email is already taken."}, status=status.HTTP_400_BAD_REQUEST)
         StudentProfile.objects.create(user=user)
 
-        code = f"{random.randint(0, 999999):06d}"
+        code = generate_otp_code()
         EmailOTP.objects.create(email=email, code=code)
         try:
             send_otp_email(email, code)
@@ -574,7 +586,7 @@ class StudentResendRegistrationOtpView(APIView):
         if user is None or user.is_active:
             return Response({"detail": "Invalid or already-verified account."}, status=status.HTTP_400_BAD_REQUEST)
 
-        code = f"{random.randint(0, 999999):06d}"
+        code = generate_otp_code()
         EmailOTP.objects.create(email=user.email, code=code)
         try:
             send_otp_email(user.email, code)
@@ -601,7 +613,7 @@ class StudentRequestOtpView(APIView):
         if user is None:
             return Response({"detail": "No account found for that username or email."}, status=status.HTTP_404_NOT_FOUND)
 
-        code = f"{random.randint(0, 999999):06d}"
+        code = generate_otp_code()
         EmailOTP.objects.create(email=user.email, code=code)
         try:
             send_otp_email(user.email, code)

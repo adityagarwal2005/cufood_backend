@@ -35,11 +35,6 @@ DEBUG = env.bool("DJANGO_DEBUG", default=True)
 
 ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["localhost", "127.0.0.1"])
 
-# Render sets this automatically to the service's *.onrender.com domain.
-RENDER_EXTERNAL_HOSTNAME = env("RENDER_EXTERNAL_HOSTNAME", default=None)
-if RENDER_EXTERNAL_HOSTNAME:
-    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
-
 
 # Application definition
 
@@ -152,7 +147,7 @@ STORAGES = {
 # Django REST Framework
 
 REST_FRAMEWORK = {
-    # Token, not session+CSRF: the frontend (Vercel) and backend (Render)
+    # Token, not session+CSRF: the frontend (Vercel) and backend (Cloud Run)
     # are different domains, so JS on the frontend can never read a CSRF
     # cookie the backend set (cookies are scoped to the domain that set
     # them — SameSite doesn't change that). That silently 403'd every
@@ -203,8 +198,6 @@ CSRF_TRUSTED_ORIGINS = env.list(
         "http://127.0.0.1:8080",
     ],
 )
-if RENDER_EXTERNAL_HOSTNAME:
-    CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
 
 
 # Razorpay — students pay into this account (the platform's own), not each
@@ -228,8 +221,9 @@ VAPID_PUBLIC_KEY = env.str(
     default="BOsXYYIQK2rY1nET_I-NXr-A6ts9_WDH9kEjZYBUC7mGhcfLqRLy3jbXtD3X72WZU1gaAqI_yOz8pO_6FNhhHqo",
 )
 
-# PEM keys are multi-line; stored in .env / Render's env editor as a single
-# line with literal \n escapes (both are single-line-only), unescaped here.
+# PEM keys are multi-line; stored in .env / Cloud Run's env editor as a
+# single line with literal \n escapes (both are single-line-only), unescaped
+# here.
 _vapid_private_key_raw = env.str("VAPID_PRIVATE_KEY", default="")
 VAPID_PRIVATE_KEY = _vapid_private_key_raw.replace("\\n", "\n")
 VAPID_CLAIM_EMAIL = env.str("VAPID_CLAIM_EMAIL", default="mailto:admin@cufood.app")
@@ -248,13 +242,13 @@ RESEND_API_KEY = env.str("RESEND_API_KEY", default="")
 OTP_FROM_EMAIL = env.str("OTP_FROM_EMAIL", default="CUFood <onboarding@resend.dev>")
 
 
-# Production hardening (only applies when DEBUG=False, i.e. on Render)
+# Production hardening (only applies when DEBUG=False, i.e. on Cloud Run)
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
-    # The frontend (Vercel) and this backend (Render) are on different
+    # The frontend (Vercel) and this backend (Cloud Run) are on different
     # domains, so owner login is a cross-site request. Django's default
     # SameSite=Lax cookies are dropped by the browser on cross-site
     # fetch/XHR calls (only same-site or top-level link navigation are

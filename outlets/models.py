@@ -1,4 +1,4 @@
-import random
+import secrets
 import string
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -23,10 +23,17 @@ def is_within_business_hours(now=None):
 
 
 def generate_order_code():
-    """6-char code the student shows at pickup and the owner can search by."""
+    """6-char code the student shows at pickup and the owner can search by.
+
+    secrets rather than random: this code is the only thing OrderStatusView,
+    RetryPaymentView and SubscribeOrderPushView check before handing back an
+    order's details, so it's a bearer credential and not just a label. The
+    Mersenne Twister behind random is reconstructable from enough observed
+    output, and anyone can generate observations at will by placing their
+    own orders."""
     alphabet = string.ascii_uppercase + string.digits
     while True:
-        code = "".join(random.choices(alphabet, k=6))
+        code = "".join(secrets.choice(alphabet) for _ in range(6))
         if not Order.objects.filter(order_code=code).exists():
             return code
 
