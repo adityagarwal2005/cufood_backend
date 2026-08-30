@@ -4,10 +4,11 @@ import secrets
 import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from time import monotonic
 from urllib.parse import quote
 
 import razorpay
-import resend
+import requests
 from django.conf import settings
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
@@ -58,7 +59,14 @@ def _send_webpush_to(subscriptions, title, body, url, context_label):
     permission revoked, etc.) — deleting it rather than retrying it forever."""
     if not settings.VAPID_PRIVATE_KEY:
         return
+    deadline = monotonic() + PUSH_TOTAL_BUDGET_SECONDS
     for sub in subscriptions:
+        # One slow endpoint shouldn't spend the whole budget and leave the
+        # caller waiting on the rest. Notifications are a bonus — the
+        # status page still updates by polling without them.
+        if monotonic() > deadline:
+            logger.warning("Push budget exhausted for %s; skipping remaining", context_label)
+            return
         try:
             webpush(
                 subscription_info={
@@ -68,6 +76,7 @@ def _send_webpush_to(subscriptions, title, body, url, context_label):
                 data=json.dumps({"title": title, "body": body, "url": url}),
                 vapid_private_key=settings.VAPID_PRIVATE_KEY,
                 vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
+                timeout=PUSH_TIMEOUT_SECONDS,
             )
         except WebPushException as err:
             status_code = getattr(err.response, "status_code", None)
@@ -77,6 +86,51 @@ def _send_webpush_to(subscriptions, title, body, url, context_label):
                 logger.warning("Push failed for %s: %s", context_label, err)
         except Exception:
             logger.exception("Unexpected error sending push for %s", context_label)
+
+
+# Outbound calls to third parties (Resend, browser push services) run
+# inline on request paths — including the Razorpay webhook and the callback
+# a student's browser is sitting on. `requests` defaults to NO timeout, so
+# a peer that accepts the connection and then goes quiet blocks the worker
+# until Cloud Run's request timeout (minutes, not seconds). With
+# gunicorn --workers 2, two such calls take a whole instance out of
+# service. Everything below is therefore explicitly bounded.
+#
+# These can't simply be moved to a background thread: this service runs
+# with Cloud Run's default CPU throttling, so work started during a request
+# is not guaranteed CPU once the response is sent. Bounding the calls is
+# the fix that actually holds here; a real queue (Cloud Tasks) is the
+# longer-term answer.
+EMAIL_TIMEOUT_SECONDS = 5
+PUSH_TIMEOUT_SECONDS = 5
+# Ceiling across ALL of one recipient's subscriptions, since the loop below
+# is sequential and a device can hold several.
+PUSH_TOTAL_BUDGET_SECONDS = 12
+
+
+def send_resend_email(payload):
+    """POST one email to Resend, with a timeout.
+
+    Deliberately not send_resend_email(): that SDK calls
+    requests.request(...) with no timeout and offers no way to supply one,
+    which is exactly the unbounded block described above. The API itself is
+    a single JSON POST, so calling it directly costs nothing and gives us
+    the timeout.
+
+    Raises on failure. Callers decide whether that is fatal (send_otp_email,
+    where a silently unsent code is worse than an error) or best-effort
+    (the order emails, which must never fail a payment transition)."""
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=EMAIL_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def send_order_push(order, title, body):
@@ -431,9 +485,8 @@ def send_order_confirmation_email(order):
         f'<p style="margin:22px 0 0;">'
         f'{email_button(f"{SITE_URL}/order-status.html?code={order.order_code}", "Track your order")}</p>'
     )
-    resend.api_key = settings.RESEND_API_KEY
     try:
-        resend.Emails.send({
+        send_resend_email({
             "from": settings.OTP_FROM_EMAIL,
             "to": [order.student.email],
             "subject": f"Order placed at {order.restaurant.name} (#{order.order_code})",
@@ -473,9 +526,8 @@ def send_order_rejected_email(order, refunded):
         f'<p style="margin:22px 0 0;">'
         f'{email_button(f"{SITE_URL}/location-select.html", "Order something else")}</p>'
     )
-    resend.api_key = settings.RESEND_API_KEY
     try:
-        resend.Emails.send({
+        send_resend_email({
             "from": settings.OTP_FROM_EMAIL,
             "to": [order.student.email],
             "subject": f"Order #{order.order_code} was declined — refund on its way"
@@ -490,8 +542,7 @@ def send_order_rejected_email(order, refunded):
 def send_otp_email(email, code):
     if not settings.RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY is not configured.")
-    resend.api_key = settings.RESEND_API_KEY
-    resend.Emails.send({
+    send_resend_email({
         "from": settings.OTP_FROM_EMAIL,
         "to": [email],
         "subject": f"Your CUFood login code is {code}",

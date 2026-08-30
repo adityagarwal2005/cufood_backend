@@ -304,5 +304,18 @@ if not DEBUG:
     SESSION_COOKIE_SAMESITE = "None"
     CSRF_COOKIE_SAMESITE = "None"
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-    SECURE_HSTS_SECONDS = 3600
+    # One year, the value browsers and scanners expect. The old 3600 was a
+    # cautious starting value: it means a browser stops enforcing HTTPS an
+    # hour after its last visit, so anyone returning the next day is
+    # downgradeable again and the header buys almost nothing.
+    #
+    # Env-driven because HSTS is the one header you cannot take back
+    # quickly — browsers honour the last max-age they saw for its full
+    # duration, so serving a bad value is sticky. Lowering this setting
+    # only affects new responses. If HTTPS ever has to be broken for a
+    # subdomain, set DJANGO_HSTS_SECONDS=0 and let the old value age out.
+    #
+    # SECURE_HSTS_PRELOAD is deliberately NOT set: preload submission is
+    # effectively irreversible and needs a real decision, not a default.
+    SECURE_HSTS_SECONDS = env.int("DJANGO_HSTS_SECONDS", default=31536000)
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
