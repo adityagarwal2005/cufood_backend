@@ -97,8 +97,34 @@ DATABASES = {
 # CONN_HEALTH_CHECKS pairs with it so a connection that went stale during
 # its 60s (network blip, Supabase-side timeout) gets detected and replaced
 # instead of failing the request.
-DATABASES["default"]["CONN_MAX_AGE"] = 60
+#
+# READ THIS BEFORE SCALING UP. A held connection is a connection nobody
+# else can have, and Supabase's session-mode pooler (port 5432) caps the
+# whole project at 15:
+#
+#     Cloud Run maxScale x gunicorn --workers  =  peak connections
+#     20 instances       x 2                   =  40   vs a limit of 15
+#
+# So past ~8 concurrent instances, requests start failing with
+# "(EMAXCONNSESSION) max clients reached in session mode". That is
+# invisible under light traffic and shows up exactly when traffic
+# arrives. Two ways out, in order of preference:
+#
+#   1. Point DATABASE_URL at the TRANSACTION pooler (port 6543), which is
+#      built for autoscaling workloads, and set CONN_MAX_AGE=0 plus
+#      DB_DISABLE_SERVER_SIDE_CURSORS=True (transaction mode multiplexes
+#      connections between statements, so neither persistent sessions nor
+#      server-side cursors survive). Keep migrations pointed at 5432.
+#   2. Leave the session pooler and set CONN_MAX_AGE=0, trading the
+#      handshake cost back for connections that are released immediately.
+#
+# Both are env-driven so they can be changed on the running service
+# without a redeploy; the defaults below preserve current behaviour.
+DATABASES["default"]["CONN_MAX_AGE"] = env.int("DB_CONN_MAX_AGE", default=60)
 DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = env.bool(
+    "DB_DISABLE_SERVER_SIDE_CURSORS", default=False
+)
 
 
 # Password validation
@@ -162,12 +188,32 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.AllowAny",
     ],
     "DEFAULT_THROTTLE_RATES": {
-        # Applied to LoginView via throttle_scope = "login" — slows down
-        # brute-force password guessing without needing a new dependency.
-        "login": "5/min",
-        # Applied to order create/verify/lookup — keeps genuine ordering
-        # snappy while making order-code enumeration impractical.
+        # Coarse per-IP ceiling on the auth endpoints. Raised from 5/min
+        # because it is keyed on IP: behind campus NAT the entire campus
+        # shares one bucket, and 5/min meant a handful of students logging
+        # in at lunchtime locked everyone else out. The per-account limit
+        # below is what actually bounds guessing against one account.
+        "login": "60/min",
+        # Per targeted account (see outlets/throttles.py), so brute-forcing
+        # one login stays slow no matter how many IPs it comes from, while
+        # students on shared wifi don't contend with each other.
+        "login_identifier": "8/min",
+        # Order CREATION only. This one is reached through IsAuthenticated,
+        # so DRF keys it on the student's user id rather than their IP —
+        # a strict limit here bounds one account, not everyone sharing a
+        # network.
         "orders": "30/min",
+        # Order READS: the status page and its supporting calls. These are
+        # deliberately unauthenticated (a pickup code is all a student
+        # needs), so DRF falls back to keying on IP — and on campus wifi
+        # that is one bucket for everybody. order-status.js polls every 3s
+        # (20/min per open page), so the old shared 30/min limit was
+        # exhausted by two students paying at once, 429ing everyone else.
+        #
+        # Enumeration is still hopeless at this rate: order codes are 36^6
+        # (~2.2 billion) and now come from secrets, so even 600/min is on
+        # the order of centuries to search.
+        "order_status": "600/min",
     },
 }
 

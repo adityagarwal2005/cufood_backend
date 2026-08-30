@@ -32,10 +32,21 @@ def generate_order_code():
     output, and anyone can generate observations at will by placing their
     own orders."""
     alphabet = string.ascii_uppercase + string.digits
-    while True:
+    # The exists() check narrows collisions but cannot eliminate them —
+    # two orders created concurrently can both find the same code free
+    # before either inserts, and the unique constraint then raises
+    # IntegrityError at save time. CreateOrderView has no handler for
+    # that, so it would surface as a 500 on an order the student is about
+    # to pay for. Retrying is what makes the caller's insert safe; see
+    # create_order_with_unique_code().
+    for _ in range(10):
         code = "".join(secrets.choice(alphabet) for _ in range(6))
         if not Order.objects.filter(order_code=code).exists():
             return code
+    # 10 straight collisions means the space is genuinely crowded, not
+    # that we got unlucky — fall through to a value the caller's retry
+    # loop can still resolve rather than spinning here forever.
+    return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
 class Location(models.Model):
@@ -129,15 +140,33 @@ class EmailOTP(models.Model):
     # be brute-forced within its 10-minute window.
     MAX_ATTEMPTS = 5
 
-    email = models.EmailField()
+    email = models.EmailField(db_index=True)
     code = models.CharField(max_length=6)
     created_at = models.DateTimeField(auto_now_add=True)
     consumed = models.BooleanField(default=False)
     attempts = models.PositiveSmallIntegerField(default=0)
 
+    class Meta:
+        # Every verification looks up (email, consumed) newest-first. Without
+        # this the lookup is a sequential scan of a table that only ever
+        # grows — on the login path.
+        indexes = [models.Index(fields=["email", "-created_at"])]
+
     @property
     def is_expired(self):
         return timezone.now() - self.created_at > timezone.timedelta(minutes=self.OTP_TTL_MINUTES)
+
+    @classmethod
+    def issue(cls, email, code):
+        """Create a code for `email`, dropping that address's older ones.
+
+        Two reasons, one of each kind. Rows here were never cleaned up, so
+        the table grew without bound for the lifetime of the app. And
+        leaving previous codes live means several valid codes per inbox at
+        once, each with its own attempts budget — issuing a new one should
+        retire the old."""
+        cls.objects.filter(email=email).delete()
+        return cls.objects.create(email=email, code=code)
 
 
 class MenuItem(models.Model):
@@ -284,12 +313,27 @@ class Order(models.Model):
     estimated_ready_at = models.DateTimeField(null=True, blank=True)
     # Null means "as soon as possible" — the default and by far the common
     # case. When set, the student picked a future pickup slot at checkout
-    # (see CreateOrderView), and mark_preparing() below targets that time
+    # (see CreateOrderView), and set_ready_estimate() below targets that time
     # instead of "now + estimated_ready_minutes".
     scheduled_for = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            # RazorpayWebhookView and RazorpayCallbackView both look an
+            # order up by this on every single payment. It had no index at
+            # all, so each payment was a sequential scan of the orders
+            # table — the one query that must not get slower as the app
+            # succeeds.
+            models.Index(fields=["razorpay_order_id"]),
+            # The two polled list endpoints: "my orders newest-first" and
+            # the owner dashboard. The plain FK indexes find the rows but
+            # leave Postgres sorting them every time.
+            models.Index(fields=["student", "-created_at"]),
+            models.Index(fields=["restaurant", "-created_at"]),
+        ]
 
     def expire_if_stale(self):
         """Called on read (order lookup, retry-payment) rather than on a
@@ -306,8 +350,13 @@ class Order(models.Model):
             self.payment_status = self.PAYMENT_EXPIRED
             self.save(update_fields=["payment_status", "updated_at"])
 
-    def mark_preparing(self):
-        self.status = self.STATUS_PREPARING
+    def set_ready_estimate(self):
+        """Fill in estimated_ready_at when an order is accepted.
+
+        Status is no longer set here: AcceptOrderView claims the
+        placed -> preparing move with a conditional UPDATE first (see
+        claim_order_status), so by the time this runs the transition is
+        already won and this only records the timing."""
         now = timezone.now()
         asap_ready = now + timezone.timedelta(minutes=self.estimated_ready_minutes)
         # A scheduled order accepted well ahead of its slot should still
@@ -319,7 +368,7 @@ class Order(models.Model):
             self.estimated_ready_at = self.scheduled_for
         else:
             self.estimated_ready_at = asap_ready
-        self.save(update_fields=["status", "estimated_ready_at", "updated_at"])
+        self.save(update_fields=["estimated_ready_at", "updated_at"])
 
     def __str__(self):
         return f"Order {self.order_code} ({self.restaurant.name})"

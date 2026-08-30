@@ -14,7 +14,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q, Sum
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
@@ -30,6 +30,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
+from .throttles import LoginIdentifierThrottle
 from .models import (
     IST,
     EmailOTP,
@@ -252,7 +253,7 @@ class LoginView(APIView):
     state-changing request would fail CSRF validation. A token sent as a
     normal Authorization header has no such dependency."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
@@ -276,6 +277,40 @@ class LogoutView(APIView):
     def post(self, request):
         request.user.auth_token.delete()
         return Response({"detail": "Logged out"})
+
+
+def consume_otp(email, submitted_code):
+    """Verify a submitted OTP for `email`. Returns (ok, error_detail).
+
+    Two things here are deliberate. The attempts counter is incremented
+    with an F() expression so it happens inside the database — a Python
+    read-modify-write lets concurrent wrong guesses all read the same
+    value and write back the same +1, which quietly defeats MAX_ATTEMPTS
+    (the only per-code guard there is; the request throttle is per-IP).
+
+    And the code itself is compared with compare_digest rather than !=,
+    so the comparison doesn't return early on the first wrong byte."""
+    otp_row = (
+        EmailOTP.objects.filter(email=email, consumed=False)
+        .order_by("-created_at")
+        .first()
+    )
+    if otp_row is None or otp_row.is_expired or otp_row.attempts >= EmailOTP.MAX_ATTEMPTS:
+        return False, "That code has expired. Request a new one."
+
+    if not secrets.compare_digest(str(otp_row.code), str(submitted_code)):
+        EmailOTP.objects.filter(pk=otp_row.pk).update(attempts=F("attempts") + 1)
+        return False, "Incorrect code."
+
+    # Conditional on consumed=False so a code replayed twice in parallel
+    # is only ever accepted once.
+    claimed = EmailOTP.objects.filter(pk=otp_row.pk, consumed=False).update(consumed=True)
+    if not claimed:
+        return False, "That code has already been used. Request a new one."
+    return True, None
+
+
+GENERIC_OTP_SENT = "If that account exists, a login code has been sent to its email."
 
 
 def generate_otp_code():
@@ -526,7 +561,7 @@ class StudentRegisterView(APIView):
         StudentProfile.objects.create(user=user)
 
         code = generate_otp_code()
-        EmailOTP.objects.create(email=email, code=code)
+        EmailOTP.issue(email, code)
         try:
             send_otp_email(email, code)
         except Exception:
@@ -543,7 +578,7 @@ class StudentVerifyRegistrationView(APIView):
     """Step 2 — the code from StudentRegisterView. Activates the account
     and logs the student in, same as a normal login would."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
@@ -554,20 +589,10 @@ class StudentVerifyRegistrationView(APIView):
         if user is None or user.is_active:
             return Response({"detail": "Invalid or already-verified account."}, status=status.HTTP_400_BAD_REQUEST)
 
-        otp_row = (
-            EmailOTP.objects.filter(email=user.email, consumed=False)
-            .order_by("-created_at")
-            .first()
-        )
-        if otp_row is None or otp_row.is_expired or otp_row.attempts >= EmailOTP.MAX_ATTEMPTS:
-            return Response({"detail": "That code has expired. Request a new one."}, status=status.HTTP_400_BAD_REQUEST)
-        if otp_row.code != otp:
-            otp_row.attempts += 1
-            otp_row.save(update_fields=["attempts"])
-            return Response({"detail": "Incorrect code."}, status=status.HTTP_400_BAD_REQUEST)
+        ok, otp_error = consume_otp(user.email, otp)
+        if not ok:
+            return Response({"detail": otp_error}, status=status.HTTP_400_BAD_REQUEST)
 
-        otp_row.consumed = True
-        otp_row.save(update_fields=["consumed"])
         user.is_active = True
         user.save(update_fields=["is_active"])
         return student_auth_response(user)
@@ -577,7 +602,7 @@ class StudentResendRegistrationOtpView(APIView):
     """Resend the verification code for an account still stuck at step 1
     (e.g. the first email got lost, or the code expired)."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
@@ -587,7 +612,7 @@ class StudentResendRegistrationOtpView(APIView):
             return Response({"detail": "Invalid or already-verified account."}, status=status.HTTP_400_BAD_REQUEST)
 
         code = generate_otp_code()
-        EmailOTP.objects.create(email=user.email, code=code)
+        EmailOTP.issue(user.email, code)
         try:
             send_otp_email(user.email, code)
         except Exception:
@@ -604,17 +629,24 @@ class StudentRequestOtpView(APIView):
     the "email + OTP" and "username + OTP" login modes (identifier can be
     either; the code always goes to the email on file)."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
         identifier = (request.data.get("identifier") or "").strip()
         user = find_student_by_identifier(identifier)
+        # Deliberately the same answer whether or not the account exists.
+        # Returning 404 here turned this endpoint into an account
+        # enumerator: anyone could test usernames/emails and learn which
+        # ones are registered — which sits oddly next to the care taken
+        # below not to echo the address back. The client just moves on to
+        # the code-entry step either way; a nonexistent account simply
+        # never receives a code to enter.
         if user is None:
-            return Response({"detail": "No account found for that username or email."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"detail": GENERIC_OTP_SENT})
 
         code = generate_otp_code()
-        EmailOTP.objects.create(email=user.email, code=code)
+        EmailOTP.issue(user.email, code)
         try:
             send_otp_email(user.email, code)
         except Exception:
@@ -626,14 +658,14 @@ class StudentRequestOtpView(APIView):
         # Doesn't echo back the email — the student already knows which
         # inbox they're checking, and this avoids confirming account
         # details for whatever partial identifier they typed.
-        return Response({"detail": "A login code has been sent to your email."})
+        return Response({"detail": GENERIC_OTP_SENT})
 
 
 class StudentLoginView(APIView):
     """Handles all four login modes from one endpoint: identifier is either
     a username or an email, and exactly one of password/otp is provided."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
@@ -652,19 +684,9 @@ class StudentLoginView(APIView):
             return student_auth_response(user)
 
         if otp:
-            otp_row = (
-                EmailOTP.objects.filter(email=user.email, consumed=False)
-                .order_by("-created_at")
-                .first()
-            )
-            if otp_row is None or otp_row.is_expired or otp_row.attempts >= EmailOTP.MAX_ATTEMPTS:
-                return Response({"detail": "That code has expired. Request a new one."}, status=status.HTTP_401_UNAUTHORIZED)
-            if otp_row.code != otp:
-                otp_row.attempts += 1
-                otp_row.save(update_fields=["attempts"])
-                return Response({"detail": "Incorrect code."}, status=status.HTTP_401_UNAUTHORIZED)
-            otp_row.consumed = True
-            otp_row.save(update_fields=["consumed"])
+            ok, otp_error = consume_otp(user.email, otp)
+            if not ok:
+                return Response({"detail": otp_error}, status=status.HTTP_401_UNAUTHORIZED)
             return student_auth_response(user)
 
         return Response({"detail": "A password or code is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -689,7 +711,16 @@ class StudentOrdersView(APIView):
     def get(self, request):
         if not hasattr(request.user, "student_profile"):
             return Response({"detail": "Not a student account."}, status=status.HTTP_404_NOT_FOUND)
-        orders = Order.objects.filter(student=request.user).order_by("-created_at")[:100]
+        # select_related/prefetch_related are load-bearing, not a
+        # micro-optimisation: both serializers read order.restaurant and
+        # order.items per row, so without them this is 1 + 2N queries —
+        # ~201 for a full page. active-orders.js polls this every 30s.
+        orders = (
+            Order.objects.filter(student=request.user)
+            .select_related("restaurant")
+            .prefetch_related("items")
+            .order_by("-created_at")[:100]
+        )
         return Response(OrderSerializer(orders, many=True).data)
 
 
@@ -833,6 +864,27 @@ def parse_scheduled_for(raw_value):
     return scheduled_for, None
 
 
+def create_order_with_unique_code(**fields):
+    """Create an Order, retrying if its generated code collides.
+
+    order_code is unique and defaults to a random value, so two orders
+    created at the same moment can pick the same code and the second
+    insert fails. Without this that IntegrityError reaches the student as
+    a 500 at the worst possible moment — right before payment. Each retry
+    re-runs the default and gets a fresh code."""
+    for attempt in range(5):
+        try:
+            with transaction.atomic():
+                return Order.objects.create(**fields)
+        except IntegrityError:
+            # Only swallow the collision we know how to fix; anything
+            # else (a real constraint problem) should surface.
+            if attempt == 4:
+                raise
+            logger.warning("order_code collision, retrying (attempt %s)", attempt + 1)
+    raise IntegrityError("Could not allocate a unique order_code")
+
+
 class CreateOrderView(APIView):
     """Validates a student's cart server-side (never trust client-sent
     prices), creates the Order + OrderItems in 'placed'/payment 'pending',
@@ -943,7 +995,7 @@ class CreateOrderView(APIView):
         # total_amount is what's actually charged (subtotal + platform fee)
         # — the restaurant's own payout is total_amount - platform_fee,
         # computed wherever an owner needs to see it (see OwnerOrderSerializer).
-        order = Order.objects.create(
+        order = create_order_with_unique_code(
             restaurant=restaurant,
             student=request.user,
             student_name=student_name,
@@ -991,7 +1043,7 @@ class RetryPaymentView(APIView):
     Razorpay order details so Checkout can be reopened for it."""
 
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "orders"
+    throttle_scope = "order_status"
 
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
@@ -1070,8 +1122,13 @@ class RazorpayWebhookView(APIView):
 
     permission_classes = [AllowAny]
     authentication_classes = []
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "orders"
+    # Deliberately unthrottled. Every webhook arrives from Razorpay's own
+    # handful of IPs, so any IP-keyed limit is a single platform-wide
+    # bucket — above that many payments a minute Razorpay starts getting
+    # 429s and payment confirmation stalls exactly when the platform is
+    # busiest. The HMAC signature check below is what makes this endpoint
+    # safe to expose; a rate limit adds nothing to that and costs
+    # confirmations.
 
     def post(self, request):
         raw_body = request.body
@@ -1131,7 +1188,7 @@ class RazorpayCallbackView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "orders"
+    throttle_scope = "order_status"
 
     def _redirect(self, order_code, failed=False):
         if not order_code:
@@ -1205,7 +1262,7 @@ class OrderStatusView(APIView):
     enumeration of other students' order codes impractical."""
 
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "orders"
+    throttle_scope = "order_status"
 
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
@@ -1223,7 +1280,7 @@ class SubscribeOrderPushView(APIView):
     the same amount of access the status page itself grants."""
 
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "orders"
+    throttle_scope = "order_status"
 
     def post(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
@@ -1288,9 +1345,15 @@ class MyOrdersView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        orders = Order.objects.filter(restaurant=restaurant).exclude(
-            status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING
-        ).order_by("-created_at")[:100]
+        # Same 1 + 2N problem as StudentOrdersView — and this one is
+        # polled continuously by every open dashboard.
+        orders = (
+            Order.objects.filter(restaurant=restaurant)
+            .exclude(status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING)
+            .select_related("restaurant")
+            .prefetch_related("items")
+            .order_by("-created_at")[:100]
+        )
         return Response(OwnerOrderSerializer(orders, many=True).data)
 
 
@@ -1364,7 +1427,7 @@ class AdminLoginView(APIView):
     it). Accepts username or email, same as student login, since there's
     no reason a superuser should have to remember which one they used."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopedRateThrottle, LoginIdentifierThrottle]
     throttle_scope = "login"
 
     def post(self, request):
@@ -1475,6 +1538,37 @@ class AdminStatsView(APIView):
         })
 
 
+def claim_order_status(order, expected_status, new_status):
+    """Atomically move an order from expected_status to new_status.
+
+    Every owner action below is a check-then-act on a row two dashboard
+    tabs (or one double-tapped button) can reach at the same time. Reading
+    the row, deciding, then writing leaves a window where both callers see
+    the same "still placed" state and both act on it — which for
+    RejectOrderView meant both could reach the Razorpay refund call.
+
+    The conditional UPDATE closes that window: it only matches while the
+    row is still in expected_status, so exactly one caller gets a non-zero
+    rowcount and proceeds. Returns True only for that caller."""
+    claimed = Order.objects.filter(pk=order.pk, status=expected_status).update(
+        status=new_status, updated_at=timezone.now()
+    )
+    if not claimed:
+        return False
+    order.status = new_status
+    return True
+
+
+def stale_transition_response(order_code, expected):
+    """Shared 409 for a transition another request already made."""
+    order = Order.objects.filter(order_code=order_code).first()
+    actual = order.status if order else "unknown"
+    return Response(
+        {"detail": f"Order is '{actual}', not '{expected}' — it may have just been updated elsewhere."},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
 class AcceptOrderView(APIView):
     """Accepting is the owner's one and only decision point — it says 'yes,
     we can make this' AND starts prep immediately, in one tap. That's safe
@@ -1489,17 +1583,16 @@ class AcceptOrderView(APIView):
         order, error = get_order_for_owner(request.user, order_code)
         if error is not None:
             return error
-        if order.status != Order.STATUS_PLACED:
-            return Response(
-                {"detail": f"Order is '{order.status}', not awaiting a decision."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         if order.payment_status != Order.PAYMENT_PAID:
             return Response(
                 {"detail": "This order hasn't been paid yet."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        order.mark_preparing()
+        # Claimed rather than checked-then-written so a double-tap can't
+        # send the student two "Order accepted" pushes.
+        if not claim_order_status(order, Order.STATUS_PLACED, Order.STATUS_PREPARING):
+            return stale_transition_response(order_code, Order.STATUS_PLACED)
+        order.set_ready_estimate()
         send_order_push(order, "Order accepted", f"{order.restaurant.name} is preparing your order.")
         return Response(OwnerOrderSerializer(order).data)
 
@@ -1519,13 +1612,17 @@ class RejectOrderView(APIView):
         order, error = get_order_for_owner(request.user, order_code)
         if error is not None:
             return error
-        if order.status != Order.STATUS_PLACED:
-            return Response(
-                {"detail": f"Order is '{order.status}', not awaiting a decision."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
-        if order.payment_status == Order.PAYMENT_PAID:
+        # Claim the rejection BEFORE touching Razorpay. The refund below
+        # moves real money and is not idempotent on our side, so it must
+        # be reachable by exactly one request even if the owner
+        # double-taps or has two tabs open. Losing this claim means
+        # another request already handled it — do nothing.
+        was_paid = order.payment_status == Order.PAYMENT_PAID
+        if not claim_order_status(order, Order.STATUS_PLACED, Order.STATUS_REJECTED):
+            return stale_transition_response(order_code, Order.STATUS_PLACED)
+
+        if was_paid:
             try:
                 # "optimum" attempts an instant refund (small per-refund fee,
                 # confirmed with Razorpay directly) rather than "normal"
@@ -1575,11 +1672,19 @@ class RejectOrderView(APIView):
                     "Razorpay account before its first settlement clears — check Razorpay's dashboard "
                     "or contact their support if this keeps happening."
                 )
+                # Hand the claim back. The original behaviour here was to
+                # leave the order un-rejected so the owner can just try
+                # again rather than it silently ending up 'rejected' with
+                # no refund actually issued — that has to be restored
+                # explicitly now that the status was claimed up front.
+                Order.objects.filter(pk=order.pk, status=Order.STATUS_REJECTED).update(
+                    status=Order.STATUS_PLACED, updated_at=timezone.now()
+                )
+                order.status = Order.STATUS_PLACED
                 return Response({"detail": detail}, status=status.HTTP_502_BAD_GATEWAY)
             order.razorpay_refund_id = refund["id"]
             order.payment_status = Order.PAYMENT_REFUNDED
 
-        order.status = Order.STATUS_REJECTED
         order.save(update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"])
         refunded = order.payment_status == Order.PAYMENT_REFUNDED
         send_order_push(
@@ -1599,13 +1704,8 @@ class MarkOrderReadyView(APIView):
         order, error = get_order_for_owner(request.user, order_code)
         if error is not None:
             return error
-        if order.status != Order.STATUS_PREPARING:
-            return Response(
-                {"detail": f"Order is '{order.status}', not being prepared."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        order.status = Order.STATUS_READY
-        order.save(update_fields=["status", "updated_at"])
+        if not claim_order_status(order, Order.STATUS_PREPARING, Order.STATUS_READY):
+            return stale_transition_response(order_code, Order.STATUS_PREPARING)
         send_order_push(order, "Ready for pickup!", f"Your order from {order.restaurant.name} is ready — go collect it.")
         return Response(OwnerOrderSerializer(order).data)
 
@@ -1617,11 +1717,6 @@ class CompleteOrderView(APIView):
         order, error = get_order_for_owner(request.user, order_code)
         if error is not None:
             return error
-        if order.status != Order.STATUS_READY:
-            return Response(
-                {"detail": f"Order is '{order.status}', not ready for pickup."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        order.status = Order.STATUS_COMPLETED
-        order.save(update_fields=["status", "updated_at"])
+        if not claim_order_status(order, Order.STATUS_READY, Order.STATUS_COMPLETED):
+            return stale_transition_response(order_code, Order.STATUS_READY)
         return Response(OwnerOrderSerializer(order).data)
