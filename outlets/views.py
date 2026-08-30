@@ -17,6 +17,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import TruncDate
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -1601,6 +1602,175 @@ class AdminStatsView(APIView):
             },
             "by_restaurant": by_restaurant,
             "by_location": by_location,
+        })
+
+
+class AdminReportView(APIView):
+    """Superuser-only sales report over an arbitrary date range.
+
+    AdminStatsView answers "how is today going"; this answers "how did
+    outlet X do between two dates", which is a different question and
+    needs different definitions:
+
+      successful  payment_status=paid AND the outlet accepted it
+                  (preparing / ready / completed). These are the orders
+                  that earned money.
+      rejected    the outlet declined it. Counted, not summed, because
+                  the interesting number is how often it happens — each
+                  one is a refund that costs the platform its fee.
+      awaiting    paid but still undecided. Normally zero for a past
+                  range; surfaced anyway so the three buckets add up to
+                  every paid order and the report can be trusted.
+
+    Dates are IST calendar days (the campus's day), not UTC, so "27th"
+    means what the outlet thinks it means.
+
+    Deliberately two aggregate queries plus one for items regardless of
+    how many restaurants or days are in range — building this per
+    restaurant would be a query per row on the one page that reads the
+    whole order table."""
+
+    permission_classes = [IsAuthenticated]
+
+    ACCEPTED_STATUSES = (Order.STATUS_PREPARING, Order.STATUS_READY, Order.STATUS_COMPLETED)
+    MAX_RANGE_DAYS = 400
+
+    def get(self, request):
+        if not request.user.is_superuser:
+            return Response({"detail": "Not authorized."}, status=status.HTTP_403_FORBIDDEN)
+
+        today = timezone.now().astimezone(IST).date()
+        try:
+            end_date = (
+                date.fromisoformat(request.query_params["end"])
+                if request.query_params.get("end") else today
+            )
+            start_date = (
+                date.fromisoformat(request.query_params["start"])
+                if request.query_params.get("start") else end_date - timedelta(days=6)
+            )
+        except ValueError:
+            return Response({"detail": "Invalid date, expected YYYY-MM-DD."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        if (end_date - start_date).days > self.MAX_RANGE_DAYS:
+            return Response(
+                {"detail": f"Range too large — {self.MAX_RANGE_DAYS} days maximum."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Half-open [start, end+1) so the end date is included in full.
+        range_start = datetime.combine(start_date, time.min, tzinfo=IST)
+        range_end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=IST)
+        in_range = Order.objects.filter(created_at__gte=range_start, created_at__lt=range_end)
+
+        buckets = {}
+
+        def bucket(restaurant_id, name, location):
+            return buckets.setdefault(restaurant_id, {
+                "restaurant_id": restaurant_id,
+                "restaurant_name": name,
+                "location_name": location or "",
+                "successful_orders": 0,
+                "picked_up": 0,
+                "total_sales": Decimal("0.00"),
+                "platform_revenue": Decimal("0.00"),
+                "rejected_orders": 0,
+                "refunded_amount": Decimal("0.00"),
+                "awaiting_decision": 0,
+                "_days": {},
+            })
+
+        accepted = (
+            in_range.filter(payment_status=Order.PAYMENT_PAID, status__in=self.ACCEPTED_STATUSES)
+            .annotate(day=TruncDate("created_at", tzinfo=IST))
+            .values("restaurant_id", "restaurant__name", "restaurant__location__name", "day")
+            .annotate(
+                orders=Count("id"),
+                sales=Sum("total_amount"),
+                fees=Sum("platform_fee"),
+                completed=Count("id", filter=Q(status=Order.STATUS_COMPLETED)),
+            )
+        )
+        for row in accepted:
+            b = bucket(row["restaurant_id"], row["restaurant__name"], row["restaurant__location__name"])
+            b["successful_orders"] += row["orders"]
+            b["picked_up"] += row["completed"]
+            b["total_sales"] += row["sales"] or Decimal("0.00")
+            b["platform_revenue"] += row["fees"] or Decimal("0.00")
+            day = b["_days"].setdefault(row["day"], {
+                "date": row["day"].isoformat(), "orders": 0,
+                "sales": Decimal("0.00"), "items": {},
+            })
+            day["orders"] += row["orders"]
+            day["sales"] += row["sales"] or Decimal("0.00")
+
+        # Rejections and still-undecided orders, in one pass.
+        others = (
+            in_range.filter(
+                Q(status=Order.STATUS_REJECTED)
+                | Q(payment_status=Order.PAYMENT_PAID, status=Order.STATUS_PLACED)
+            )
+            .values("restaurant_id", "restaurant__name", "restaurant__location__name", "status")
+            .annotate(orders=Count("id"), refunded=Sum("total_amount"))
+        )
+        for row in others:
+            b = bucket(row["restaurant_id"], row["restaurant__name"], row["restaurant__location__name"])
+            if row["status"] == Order.STATUS_REJECTED:
+                b["rejected_orders"] += row["orders"]
+                b["refunded_amount"] += row["refunded"] or Decimal("0.00")
+            else:
+                b["awaiting_decision"] += row["orders"]
+
+        # What was actually sold, per outlet per day.
+        items = (
+            OrderItem.objects.filter(
+                order__created_at__gte=range_start,
+                order__created_at__lt=range_end,
+                order__payment_status=Order.PAYMENT_PAID,
+                order__status__in=self.ACCEPTED_STATUSES,
+            )
+            .annotate(day=TruncDate("order__created_at", tzinfo=IST))
+            .values("order__restaurant_id", "day", "name")
+            .annotate(qty=Sum("quantity"), revenue=Sum(F("unit_price") * F("quantity")))
+        )
+        for row in items:
+            b = buckets.get(row["order__restaurant_id"])
+            if b is None:
+                continue
+            day = b["_days"].get(row["day"])
+            if day is None:
+                continue
+            entry = day["items"].setdefault(row["name"], {"name": row["name"], "quantity": 0,
+                                                          "revenue": Decimal("0.00")})
+            entry["quantity"] += row["qty"] or 0
+            entry["revenue"] += row["revenue"] or Decimal("0.00")
+
+        restaurants = []
+        for b in buckets.values():
+            days = []
+            for day in sorted(b.pop("_days").values(), key=lambda d: d["date"], reverse=True):
+                day["items"] = sorted(day["items"].values(), key=lambda i: -i["quantity"])
+                days.append(day)
+            b["days"] = days
+            restaurants.append(b)
+        restaurants.sort(key=lambda r: (-r["total_sales"], r["restaurant_name"]))
+
+        return Response({
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "totals": {
+                "successful_orders": sum(r["successful_orders"] for r in restaurants),
+                "picked_up": sum(r["picked_up"] for r in restaurants),
+                "total_sales": sum((r["total_sales"] for r in restaurants), Decimal("0.00")),
+                "platform_revenue": sum((r["platform_revenue"] for r in restaurants), Decimal("0.00")),
+                "rejected_orders": sum(r["rejected_orders"] for r in restaurants),
+                "refunded_amount": sum((r["refunded_amount"] for r in restaurants), Decimal("0.00")),
+                "awaiting_decision": sum(r["awaiting_decision"] for r in restaurants),
+            },
+            "restaurants": restaurants,
         })
 
 
