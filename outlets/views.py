@@ -402,7 +402,11 @@ def find_student_by_identifier(identifier, include_unverified=False):
 SITE_URL = "https://www.cufood.in"
 
 
-def render_branded_email(body_html):
+ORDER_FOOTER_NOTE = "You're getting this because you placed an order on CUFood."
+ACCOUNT_FOOTER_NOTE = "You're getting this because someone asked to sign in to CUFood with this address."
+
+
+def render_branded_email(body_html, footer_note=ORDER_FOOTER_NOTE):
     """Wraps an email body in the CUFood header/footer. Table-based and
     inline-styled on purpose — email clients (Gmail especially) strip
     <style> blocks and ignore most modern CSS, so anything that isn't
@@ -424,7 +428,7 @@ def render_branded_email(body_html):
         '<tr><td style="padding:16px 28px 24px;border-top:1px solid #e6e6e6;'
         'color:#6b6b6b;font-size:12px;line-height:1.5;">'
         'CUFood &middot; CU Campus<br>'
-        'You\'re getting this because you placed an order on CUFood.'
+        f'{footer_note}'
         '</td></tr>'
         '</table></div>'
     )
@@ -540,17 +544,28 @@ def send_order_rejected_email(order, refunded):
 
 
 def send_otp_email(email, code):
+    """The login/verification code. Goes through the same branded shell as
+    the order emails — a bare wall of text from an unfamiliar sender is
+    exactly what a phishing attempt looks like, and this is the first
+    email a new student ever gets from us."""
     if not settings.RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY is not configured.")
+    body = (
+        '<p style="margin:0 0 6px;font-size:20px;font-weight:bold;">Your login code</p>'
+        '<p style="margin:0 0 20px;color:#6b6b6b;">Enter this in CUFood to finish signing in.</p>'
+        '<p style="margin:0 0 6px;font-size:34px;font-weight:bold;letter-spacing:8px;'
+        f'color:#0a0a0a;">{escape(code)}</p>'
+        f'<p style="margin:0 0 18px;color:#6b6b6b;font-size:13px;">'
+        f'Expires in {EmailOTP.OTP_TTL_MINUTES} minutes.</p>'
+        '<p style="margin:0;color:#6b6b6b;font-size:13px;">'
+        "Didn't ask for this? You can ignore this email &mdash; nobody can sign "
+        'in without the code above.</p>'
+    )
     send_resend_email({
         "from": settings.OTP_FROM_EMAIL,
         "to": [email],
         "subject": f"Your CUFood login code is {code}",
-        "html": (
-            f"<p>Your CUFood login code is <strong>{code}</strong>.</p>"
-            f"<p>It expires in {EmailOTP.OTP_TTL_MINUTES} minutes. "
-            f"If you didn't request this, you can ignore this email.</p>"
-        ),
+        "html": render_branded_email(body, footer_note=ACCOUNT_FOOTER_NOTE),
     })
 
 
