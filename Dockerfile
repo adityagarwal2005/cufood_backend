@@ -27,4 +27,12 @@ ENV PYTHONUNBUFFERED=1
 # each container start rather than as a separate release step (Cloud Run
 # has no built-in equivalent to that): safe since Django migrations are
 # idempotent, already-applied ones are just a no-op.
-CMD python manage.py migrate --noinput && gunicorn cufr.wsgi --bind 0.0.0.0:${PORT:-8080} --workers 2 --log-file -
+# MIGRATION_DATABASE_URL, when set, points the migrate step at Supabase's
+# SESSION pooler (5432) while the server itself runs on the TRANSACTION
+# pooler (6543). Transaction mode multiplexes connections between
+# statements, which is what lets this service scale past the session
+# pooler's 15-connection cap — but it is not the recommended place to run
+# schema changes. The VAR=value prefix scopes the override to this one
+# command, so gunicorn below still uses the normal DATABASE_URL. Falls
+# back to DATABASE_URL when unset, so nothing breaks if it is absent.
+CMD DATABASE_URL="${MIGRATION_DATABASE_URL:-$DATABASE_URL}" python manage.py migrate --noinput && gunicorn cufr.wsgi --bind 0.0.0.0:${PORT:-8080} --workers 2 --log-file -
