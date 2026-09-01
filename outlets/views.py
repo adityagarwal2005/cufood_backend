@@ -32,7 +32,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from .throttles import LoginIdentifierThrottle
+from .throttles import LoginIdentifierThrottle, OrderStatusThrottle
 from .models import (
     IST,
     EmailOTP,
@@ -1109,7 +1109,7 @@ class RetryPaymentView(APIView):
     abandon it and place a whole new order, this hands back the same
     Razorpay order details so Checkout can be reopened for it."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [OrderStatusThrottle]
     throttle_scope = "order_status"
 
     def get(self, request, order_code):
@@ -1328,7 +1328,7 @@ class OrderStatusView(APIView):
     just the 6-char pickup code. Throttled to make brute-force
     enumeration of other students' order codes impractical."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [OrderStatusThrottle]
     throttle_scope = "order_status"
 
     def get(self, request, order_code):
@@ -1346,7 +1346,7 @@ class SubscribeOrderPushView(APIView):
     with the order code can subscribe, which is fine since that's already
     the same amount of access the status page itself grants."""
 
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [OrderStatusThrottle]
     throttle_scope = "order_status"
 
     def post(self, request, order_code):

@@ -206,17 +206,17 @@ REST_FRAMEWORK = {
         # a strict limit here bounds one account, not everyone sharing a
         # network.
         "orders": "30/min",
-        # Order READS: the status page and its supporting calls. These are
-        # deliberately unauthenticated (a pickup code is all a student
-        # needs), so DRF falls back to keying on IP — and on campus wifi
-        # that is one bucket for everybody. order-status.js polls every 3s
-        # (20/min per open page), so the old shared 30/min limit was
-        # exhausted by two students paying at once, 429ing everyone else.
+        # Order READS: the status page and its supporting calls. Keyed per
+        # ORDER CODE, not per IP (see OrderStatusThrottle) — the endpoint
+        # is unauthenticated by design, so IP keying meant the whole campus
+        # shared one bucket and it broke at ~30 concurrent students.
         #
-        # Enumeration is still hopeless at this rate: order codes are 36^6
-        # (~2.2 billion) and now come from secrets, so even 600/min is on
-        # the order of centuries to search.
-        "order_status": "600/min",
+        # Per order, this is generous: the page polls every 3s (20/min),
+        # so 60 leaves room for a couple of tabs and the retry/subscribe
+        # calls without ever limiting a legitimate student. Thousands of
+        # students on one wifi no longer contend at all, because each is
+        # watching a different code.
+        "order_status": "60/min",
     },
 }
 

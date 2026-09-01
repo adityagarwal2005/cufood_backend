@@ -48,3 +48,35 @@ class LoginIdentifierThrottle(SimpleRateThrottle):
             return None
         digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
         return self.cache_format % {"scope": self.scope, "ident": digest}
+
+
+class OrderStatusThrottle(SimpleRateThrottle):
+    """Rate-limits order lookups per ORDER, not per caller IP.
+
+    order-status.html polls while a payment is confirming. The endpoint is
+    deliberately unauthenticated — a pickup code is all a student needs —
+    so DRF's default keying falls back to IP, and on campus wifi that is
+    one bucket for thousands of people:
+
+        5,000 students polling every 3s = 100,000 req/min from one IP
+        against a shared per-IP limit, which breaks at about 30 of them.
+
+    Keying on the order code instead makes the limit mean what it should:
+    one order can be polled N times a minute. Two students watching two
+    different orders never contend, no matter how many share a network,
+    while a single code still can't be hammered — which is the only thing
+    the limit was protecting against (enumeration is already hopeless
+    against 36^6 codes drawn from secrets).
+
+    Falls back to the IP-keyed default when there's no order code in the
+    URL, so nothing is left unlimited.
+    """
+
+    scope = "order_status"
+
+    def get_cache_key(self, request, view):
+        code = (view.kwargs or {}).get("order_code")
+        if not code:
+            ident = self.get_ident(request)
+            return self.cache_format % {"scope": self.scope, "ident": ident}
+        return self.cache_format % {"scope": self.scope, "ident": str(code).upper()[:16]}
