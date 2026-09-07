@@ -243,6 +243,22 @@ class Order(models.Model):
         (PAYMENT_EXPIRED, "Expired"),
     ]
 
+    # How long an outlet has to accept or decline a paid order before the
+    # platform answers for them and refunds the student.
+    #
+    # Both sides of this are a person waiting. The student has paid and is
+    # standing there wondering whether to walk over; the outlet is a
+    # counter that may be busy, closed, or simply not looking at the
+    # tablet. Leaving the order open indefinitely serves neither: at 3pm
+    # nobody wants to accept an order placed at 10am, and the student has
+    # long since given up but is still out of pocket.
+    #
+    # Three minutes is short on purpose. It is about as long as someone
+    # will stand and wait before deciding the app is broken, and an outlet
+    # that hasn't looked at a new order in three minutes is not about to
+    # start cooking it.
+    DECISION_WINDOW_MINUTES = 3
+
     # How long a checkout can sit unpaid before it's considered abandoned.
     # Long enough that a student fumbling with their banking app isn't cut
     # off mid-payment, short enough that "expired" actually means
@@ -293,6 +309,13 @@ class Order(models.Model):
     razorpay_payment_id = models.CharField(max_length=64, blank=True)
     # Set by RejectOrderView after issuing a refund via the Razorpay API.
     razorpay_refund_id = models.CharField(max_length=64, blank=True)
+    # True when nobody at the outlet answered in time and the platform
+    # declined on their behalf (see auto_decline_unanswered_orders).
+    # Kept separate from a plain rejection because the two mean different
+    # things to the student — "they couldn't make it" versus "nobody
+    # picked it up" — and only the second is the platform's fault to
+    # apologise for.
+    auto_declined = models.BooleanField(default=False)
     # Webhook-confirmed payment time — this is real, unlike the old
     # self-reported "I've paid" timestamp it replaces.
     payment_confirmed_at = models.DateTimeField(null=True, blank=True)
@@ -334,6 +357,20 @@ class Order(models.Model):
             models.Index(fields=["student", "-created_at"]),
             models.Index(fields=["restaurant", "-created_at"]),
         ]
+
+    @property
+    def decision_deadline(self):
+        """When the outlet's chance to answer this order runs out."""
+        return self.created_at + timezone.timedelta(minutes=self.DECISION_WINDOW_MINUTES)
+
+    @property
+    def awaiting_decision(self):
+        """Paid, and the outlet can still act on it."""
+        return (
+            self.status == self.STATUS_PLACED
+            and self.payment_status == self.PAYMENT_PAID
+            and timezone.now() <= self.decision_deadline
+        )
 
     def expire_if_stale(self):
         """Called on read (order lookup, retry-payment) rather than on a

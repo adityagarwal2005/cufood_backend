@@ -99,6 +99,7 @@ class OrderSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.CharField(source="restaurant.name", read_only=True)
     restaurant_slug = serializers.CharField(source="restaurant.slug", read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)
+    decision_deadline = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = Order
@@ -118,6 +119,16 @@ class OrderSerializer(serializers.ModelSerializer):
             "scheduled_for",
             "created_at",
             "items",
+            # Distinguishes "the outlet turned this down" from "nobody
+            # answered and we refunded on their behalf" — different
+            # sentences to the student, and only the second is ours to
+            # apologise for.
+            "auto_declined",
+            # When the outlet's window to answer runs out. Sent so both
+            # dashboards can count down and stop offering a decision the
+            # server would refuse anyway, rather than each re-deriving the
+            # rule and drifting from it.
+            "decision_deadline",
         ]
 
 

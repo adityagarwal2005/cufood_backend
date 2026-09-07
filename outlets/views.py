@@ -1344,6 +1344,11 @@ class OrderStatusView(APIView):
     def get(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
         order.expire_if_stale()
+        # A student watching their own order shouldn't have to wait for
+        # the outlet's dashboard to be open for the deadline to mean
+        # anything — this page is polling anyway, so it enforces it too.
+        if auto_decline_unanswered_orders([order]):
+            order.refresh_from_db()
         return Response(OrderSerializer(order).data)
 
 
@@ -1422,15 +1427,37 @@ class MyOrdersView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        # Today only (IST, the campus's day). Yesterday's orders are not
+        # something an outlet can act on — at 3pm nobody is going to start
+        # cooking an order placed at 10am — and leaving them on the board
+        # buries the ones that still matter. History lives in the sales
+        # report, not the live queue.
+        day_start = datetime.combine(
+            timezone.now().astimezone(IST).date(), time.min, tzinfo=IST
+        )
+
         # Same 1 + 2N problem as StudentOrdersView — and this one is
         # polled continuously by every open dashboard.
-        orders = (
-            Order.objects.filter(restaurant=restaurant)
+        orders = list(
+            Order.objects.filter(restaurant=restaurant, created_at__gte=day_start)
             .exclude(status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING)
             .select_related("restaurant")
             .prefetch_related("items")
             .order_by("-created_at")[:100]
         )
+
+        # This poll is the heartbeat that closes out orders nobody
+        # answered. Doing it here means an expired order is refunded
+        # within seconds of its deadline, and the board the owner is
+        # looking at is already correct by the time it renders.
+        if auto_decline_unanswered_orders(orders):
+            orders = list(
+                Order.objects.filter(restaurant=restaurant, created_at__gte=day_start)
+                .exclude(status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING)
+                .select_related("restaurant")
+                .prefetch_related("items")
+                .order_by("-created_at")[:100]
+            )
         return Response(OwnerOrderSerializer(orders, many=True).data)
 
 
@@ -1843,6 +1870,127 @@ class AcceptOrderView(APIView):
         return Response(OwnerOrderSerializer(order).data)
 
 
+def razorpay_error_detail(exc):
+    """Pull Razorpay's own human-readable description out of an exception.
+
+    Their messages are already written for a person ("Your account does
+    not have enough balance to carry out the refund operation"), and
+    showing that instead of a generic failure is the difference between an
+    owner knowing this is an account-level hold on Razorpay's side versus
+    assuming the app is broken and hammering the button."""
+    response_body = getattr(exc, "http_body", None)
+    if isinstance(response_body, (str, bytes)):
+        try:
+            return json.loads(response_body).get("error", {}).get("description")
+        except (ValueError, AttributeError):
+            pass
+    # The Python SDK doesn't attach http_body — it raises its own error
+    # types with the description as the sole argument. Only trust str(exc)
+    # for those; a network/timeout traceback is not owner-readable.
+    if isinstance(exc, (razorpay.errors.BadRequestError,
+                        razorpay.errors.GatewayError,
+                        razorpay.errors.ServerError)):
+        return str(exc) or None
+    return None
+
+
+def release_order_claim(order, claimed_status, revert_to):
+    """Undo a claim_order_status() move after the work behind it failed.
+
+    Conditional on the row still being where we put it, so a concurrent
+    transition isn't clobbered by an unwind."""
+    Order.objects.filter(pk=order.pk, status=claimed_status).update(
+        status=revert_to, updated_at=timezone.now()
+    )
+    order.status = revert_to
+
+
+def refund_order_payment(order):
+    """Refund an order in full. Returns (ok, human_detail_on_failure).
+
+    Shared by the outlet declining an order and by the platform declining
+    on their behalf when they never answered, so both paths issue exactly
+    the same refund and neither can drift from the other.
+
+    "optimum" attempts an instant refund (small per-refund fee) rather
+    than "normal" (free, 5-7 business days) — deliberate: declines should
+    be rare, and a student getting their money back the same day after a
+    bad experience matters more than the fee.
+
+    Only mutates the in-memory order; the caller decides when to save."""
+    try:
+        refund = get_razorpay_client().payment.refund(
+            order.razorpay_payment_id,
+            {"amount": rupees_to_paise(order.total_amount), "speed": "optimum"},
+        )
+    except Exception as exc:
+        logger.exception("Razorpay refund failed for %s", order.order_code)
+        detail = razorpay_error_detail(exc)
+        return False, (
+            f"Refund failed: {detail}" if detail
+            else "Could not process the refund right now. This can happen on a brand-new "
+                 "Razorpay account before its first settlement clears — check Razorpay's "
+                 "dashboard or contact their support if this keeps happening."
+        )
+    order.razorpay_refund_id = refund["id"]
+    order.payment_status = Order.PAYMENT_REFUNDED
+    return True, None
+
+
+# A refund that just failed shouldn't be retried on the very next poll —
+# the dashboard polls every few seconds, and the most likely cause of
+# failure (an account-level hold on Razorpay, e.g. insufficient balance)
+# will still be true a moment later. Waiting between attempts turns a
+# persistent failure into a slow retry instead of a hammering loop.
+AUTO_DECLINE_RETRY_SECONDS = 60
+
+
+def auto_decline_unanswered_orders(orders):
+    """Decline and refund paid orders the outlet never answered in time.
+
+    Runs off the back of reads rather than a scheduler: the outlet's
+    dashboard and the student's status page both poll constantly, so the
+    orders that matter are looked at within seconds of their deadline
+    without this project needing a cron it otherwise has no use for.
+
+    Every mutation is claimed atomically first (see claim_order_status),
+    so it does not matter how many pollers notice the same expired order
+    at the same moment — exactly one of them refunds it.
+
+    Returns the order codes it declined."""
+    declined = []
+    now = timezone.now()
+    for order in orders:
+        if order.status != Order.STATUS_PLACED or order.payment_status != Order.PAYMENT_PAID:
+            continue
+        if now <= order.decision_deadline:
+            continue
+        # Back off after a failed attempt (updated_at moves when a claim is
+        # taken or released, so it doubles as "last touched").
+        if order.updated_at and (now - order.updated_at).total_seconds() < AUTO_DECLINE_RETRY_SECONDS:
+            continue
+        if not claim_order_status(order, Order.STATUS_PLACED, Order.STATUS_REJECTED):
+            continue  # somebody else got there first
+
+        ok, _detail = refund_order_payment(order)
+        if not ok:
+            # Never leave an order rejected without the money going back.
+            release_order_claim(order, Order.STATUS_REJECTED, Order.STATUS_PLACED)
+            continue
+
+        order.auto_declined = True
+        order.save(update_fields=[
+            "status", "payment_status", "razorpay_refund_id", "auto_declined", "updated_at",
+        ])
+        declined.append(order.order_code)
+        send_order_push(
+            order, "Order not accepted",
+            f"{order.restaurant.name} didn't confirm in time — your money is on its way back.",
+        )
+        send_order_rejected_email(order, refunded=True)
+    return declined
+
+
 class RejectOrderView(APIView):
     """Since the order was already paid before the owner ever saw it (see
     MyOrdersView), rejecting a paid order triggers a refund through the
@@ -1869,67 +2017,13 @@ class RejectOrderView(APIView):
             return stale_transition_response(order_code, Order.STATUS_PLACED)
 
         if was_paid:
-            try:
-                # "optimum" attempts an instant refund (small per-refund fee,
-                # confirmed with Razorpay directly) rather than "normal"
-                # (free, 5-7 business days) — deliberate choice: rejections
-                # should be rare, and a student getting their money back
-                # same-day after a bad experience (their order got declined)
-                # matters more than the small fee.
-                refund = get_razorpay_client().payment.refund(
-                    order.razorpay_payment_id,
-                    {"amount": rupees_to_paise(order.total_amount), "speed": "optimum"},
-                )
-            except Exception as exc:
-                logger.exception("Razorpay refund failed for %s", order.order_code)
-                # Razorpay's own error responses are already human-readable
-                # (e.g. "refunds are not enabled for this account yet") —
-                # surfacing that instead of a generic message is the
-                # difference between an owner knowing this is a Razorpay
-                # account-level hold (new accounts can't refund until their
-                # first settlement clears) versus assuming the app is
-                # broken and hammering "try again."
-                razorpay_detail = None
-                response_body = getattr(exc, "http_body", None)
-                if isinstance(response_body, (str, bytes)):
-                    try:
-                        parsed = json.loads(response_body)
-                        razorpay_detail = parsed.get("error", {}).get("description")
-                    except (ValueError, AttributeError):
-                        razorpay_detail = None
-                # The Python SDK doesn't attach http_body — it raises its own
-                # error types with Razorpay's description as the sole argument
-                # (e.g. "Your account does not have enough balance to carry
-                # out the refund operation"). Only trust str(exc) for those
-                # types; a network/timeout traceback is not owner-readable.
-                if not razorpay_detail and isinstance(
-                    exc,
-                    (
-                        razorpay.errors.BadRequestError,
-                        razorpay.errors.GatewayError,
-                        razorpay.errors.ServerError,
-                    ),
-                ):
-                    razorpay_detail = str(exc) or None
-                detail = (
-                    f"Refund failed: {razorpay_detail}"
-                    if razorpay_detail
-                    else "Could not process the refund right now. This can happen on a brand-new "
-                    "Razorpay account before its first settlement clears — check Razorpay's dashboard "
-                    "or contact their support if this keeps happening."
-                )
-                # Hand the claim back. The original behaviour here was to
-                # leave the order un-rejected so the owner can just try
-                # again rather than it silently ending up 'rejected' with
-                # no refund actually issued — that has to be restored
-                # explicitly now that the status was claimed up front.
-                Order.objects.filter(pk=order.pk, status=Order.STATUS_REJECTED).update(
-                    status=Order.STATUS_PLACED, updated_at=timezone.now()
-                )
-                order.status = Order.STATUS_PLACED
+            ok, detail = refund_order_payment(order)
+            if not ok:
+                # Hand the claim back. An order must never end up
+                # 'rejected' with no refund actually issued, so leaving it
+                # un-rejected lets the owner simply try again.
+                release_order_claim(order, Order.STATUS_REJECTED, Order.STATUS_PLACED)
                 return Response({"detail": detail}, status=status.HTTP_502_BAD_GATEWAY)
-            order.razorpay_refund_id = refund["id"]
-            order.payment_status = Order.PAYMENT_REFUNDED
 
         order.save(update_fields=["status", "payment_status", "razorpay_refund_id", "updated_at"])
         refunded = order.payment_status == Order.PAYMENT_REFUNDED
