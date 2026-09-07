@@ -360,8 +360,22 @@ class Order(models.Model):
 
     @property
     def decision_deadline(self):
-        """When the outlet's chance to answer this order runs out."""
-        return self.created_at + timezone.timedelta(minutes=self.DECISION_WINDOW_MINUTES)
+        """When the outlet's chance to answer this order runs out.
+
+        Measured from payment_confirmed_at, not created_at. The gap
+        between the two is the student in their UPI app entering a PIN,
+        and that is the student's own time — an outlet cannot answer an
+        order it has not been shown yet, and it isn't shown until payment
+        clears (see MyOrdersView, which hides unpaid orders entirely).
+        Counting from creation would quietly charge the outlet for the
+        student's fumbling and could hand them a window already half
+        spent, or expired outright on a slow payment.
+
+        Falls back to created_at only for safety; every paid order has
+        payment_confirmed_at set by mark_order_paid, and only paid orders
+        are ever measured against this."""
+        started = self.payment_confirmed_at or self.created_at
+        return started + timezone.timedelta(minutes=self.DECISION_WINDOW_MINUTES)
 
     @property
     def awaiting_decision(self):
