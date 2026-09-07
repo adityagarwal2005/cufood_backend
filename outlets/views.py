@@ -778,12 +778,22 @@ class StudentOrdersView(APIView):
     def get(self, request):
         if not hasattr(request.user, "student_profile"):
             return Response({"detail": "Not a student account."}, status=status.HTTP_404_NOT_FOUND)
+        # Only orders the student actually paid for. A checkout that was
+        # abandoned, expired, or declined before payment is not something
+        # they placed — it is a dead attempt, and listing it as history
+        # would leave them scrolling past rows for food they never bought
+        # and were never charged for. PAID and REFUNDED are exactly the
+        # orders where money moved: one they got, one they got back.
+        #
         # select_related/prefetch_related are load-bearing, not a
         # micro-optimisation: both serializers read order.restaurant and
         # order.items per row, so without them this is 1 + 2N queries —
         # ~201 for a full page. active-orders.js polls this every 30s.
         orders = (
-            Order.objects.filter(student=request.user)
+            Order.objects.filter(
+                student=request.user,
+                payment_status__in=(Order.PAYMENT_PAID, Order.PAYMENT_REFUNDED),
+            )
             .select_related("restaurant")
             .prefetch_related("items")
             .order_by("-created_at")[:100]
