@@ -844,6 +844,19 @@ class UpdateUpiIdView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        # PATCH means "change what I sent", so a request that doesn't
+        # mention upi_id must leave it alone. Reading it with a default of
+        # "" meant any malformed or partial PATCH silently blanked the
+        # field an outlet's earnings are forwarded to — a value they set
+        # once and would have no reason to re-check.
+        #
+        # An explicitly sent empty string still clears it: that is an
+        # owner deliberately removing it, which is theirs to do.
+        if "upi_id" not in request.data:
+            return Response(
+                {"detail": "upi_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         upi_id = (request.data.get("upi_id") or "").strip()
         if upi_id and "@" not in upi_id:
             return Response(
@@ -1977,9 +1990,18 @@ def auto_decline_unanswered_orders(orders):
             continue
         if now <= order.decision_deadline:
             continue
-        # Back off after a failed attempt (updated_at moves when a claim is
-        # taken or released, so it doubles as "last touched").
-        if order.updated_at and (now - order.updated_at).total_seconds() < AUTO_DECLINE_RETRY_SECONDS:
+        # Back off after a FAILED attempt, and only then. A failed sweep
+        # claims the row and releases it, which is the only thing that
+        # writes to a paid order after its deadline has passed — so
+        # "updated_at is later than the deadline" identifies exactly that,
+        # where a bare "updated_at is recent" would also catch an order
+        # that has simply never been attempted and delay a student's
+        # refund by up to a minute for no reason.
+        if (
+            order.updated_at
+            and order.updated_at > order.decision_deadline
+            and (now - order.updated_at).total_seconds() < AUTO_DECLINE_RETRY_SECONDS
+        ):
             continue
         if not claim_order_status(order, Order.STATUS_PLACED, Order.STATUS_REJECTED):
             continue  # somebody else got there first
