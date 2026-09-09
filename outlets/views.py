@@ -1446,11 +1446,23 @@ class MyOrdersView(APIView):
             .order_by("-created_at")[:100]
         )
 
-        # This poll is the heartbeat that closes out orders nobody
-        # answered. Doing it here means an expired order is refunded
-        # within seconds of its deadline, and the board the owner is
-        # looking at is already correct by the time it renders.
-        if auto_decline_unanswered_orders(orders):
+        # The sweep is deliberately NOT limited to today. The day filter
+        # above is about what an owner should be looking at; this is about
+        # money that has been taken and not yet answered for, and those
+        # are different questions. Scoping the sweep to today too meant an
+        # order that survived past midnight — student paid, closed the
+        # tab, nobody opened the dashboard again that day — was never
+        # looked at again, stranding their payment with no food and no
+        # refund. Rare, and the worst outcome the system can produce, so
+        # it is swept regardless of age.
+        unanswered = list(
+            Order.objects.filter(
+                restaurant=restaurant,
+                status=Order.STATUS_PLACED,
+                payment_status=Order.PAYMENT_PAID,
+            ).select_related("restaurant").prefetch_related("items")
+        )
+        if auto_decline_unanswered_orders(unanswered):
             orders = list(
                 Order.objects.filter(restaurant=restaurant, created_at__gte=day_start)
                 .exclude(status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PENDING)
