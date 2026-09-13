@@ -3,7 +3,7 @@ import logging
 import secrets
 import re
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from time import monotonic
 from urllib.parse import quote
 
@@ -1815,10 +1815,11 @@ class AdminReportView(APIView):
             b["platform_revenue"] += row["fees"] or Decimal("0.00")
             day = b["_days"].setdefault(row["day"], {
                 "date": row["day"].isoformat(), "orders": 0,
-                "sales": Decimal("0.00"), "items": {},
+                "sales": Decimal("0.00"), "fees": Decimal("0.00"), "items": {},
             })
             day["orders"] += row["orders"]
             day["sales"] += row["sales"] or Decimal("0.00")
+            day["fees"] += row["fees"] or Decimal("0.00")
 
         # Rejections and still-undecided orders, in one pass.
         others = (
@@ -1866,14 +1867,27 @@ class AdminReportView(APIView):
         restaurants = []
         for b in buckets.values():
             days = []
+            b["food_sales"] = Decimal("0.00")
+            b["commission"] = Decimal("0.00")
             for day in sorted(b.pop("_days").values(), key=lambda d: d["date"], reverse=True):
                 day["items"] = sorted(day["items"].values(), key=lambda i: -i["quantity"])
+                # What to send the outlet for this day: the food the students
+                # paid for (their total less the platform fee), less the
+                # platform's commission on it. Refunded and undecided orders
+                # never reach these sums.
+                food = day.pop("sales") - day.pop("fees")
+                commission = (food * Order.RESTAURANT_COMMISSION_RATE).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                day.update(sales=food, commission=commission, payout=food - commission)
+                b["food_sales"] += food
+                b["commission"] += commission
                 days.append(day)
             b["days"] = days
-            # What to send the outlet: everything the students paid for
-            # their accepted orders, less the platform fee. Refunded and
-            # undecided orders are already excluded from total_sales.
-            b["payout"] = b["total_sales"] - b["platform_revenue"]
+            # Built from the rounded daily figures, so the range total is
+            # always exactly the sum of the days shown under it.
+            b["payout"] = b["food_sales"] - b["commission"]
+            b["earnings"] = b["platform_revenue"] + b["commission"]
             restaurants.append(b)
         restaurants.sort(key=lambda r: (-r["total_sales"], r["restaurant_name"]))
 
@@ -1888,7 +1902,10 @@ class AdminReportView(APIView):
                 "rejected_orders": sum(r["rejected_orders"] for r in restaurants),
                 "refunded_amount": sum((r["refunded_amount"] for r in restaurants), Decimal("0.00")),
                 "awaiting_decision": sum(r["awaiting_decision"] for r in restaurants),
+                "food_sales": sum((r["food_sales"] for r in restaurants), Decimal("0.00")),
+                "commission": sum((r["commission"] for r in restaurants), Decimal("0.00")),
                 "payout": sum((r["payout"] for r in restaurants), Decimal("0.00")),
+                "earnings": sum((r["earnings"] for r in restaurants), Decimal("0.00")),
             },
             "restaurants": restaurants,
         })

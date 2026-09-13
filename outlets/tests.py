@@ -110,7 +110,7 @@ class UnansweredOrderSweepTests(TestCase):
         self.client.force_authenticate(self.owner_a)
         self.assertEqual(self.client.get("/api/admin/stats/").status_code, 403)
 
-    def test_report_payout_is_accepted_sales_less_platform_fee(self):
+    def test_report_payout_is_food_sales_less_commission(self):
         self.paid_order(self.outlet_a, 30, status=Order.STATUS_COMPLETED, total="101.50")
         self.paid_order(self.outlet_a, 20, status=Order.STATUS_PREPARING, total="51.50")
         rejected = self.paid_order(self.outlet_a, 10, status=Order.STATUS_REJECTED, total="41.50")
@@ -118,9 +118,15 @@ class UnansweredOrderSweepTests(TestCase):
         self.client.force_authenticate(self.admin)
         body = self.client.get("/api/admin/report/").json()
         outlet = next(r for r in body["restaurants"] if r["restaurant_name"] == "Outlet A")
-        self.assertEqual(Decimal(outlet["payout"]), Decimal("150.00"))
+        # Food 100 + 50 = 150 (fees and the refunded order excluded), less
+        # the 1% commission.
+        self.assertEqual(Decimal(outlet["food_sales"]), Decimal("150.00"))
+        self.assertEqual(Decimal(outlet["commission"]), Decimal("1.50"))
+        self.assertEqual(Decimal(outlet["payout"]), Decimal("148.50"))
+        self.assertEqual(Decimal(outlet["days"][0]["payout"]), Decimal("148.50"))
         self.assertEqual(outlet["upi_id"], "a@upi")
-        self.assertEqual(Decimal(body["totals"]["payout"]), Decimal("150.00"))
+        self.assertEqual(Decimal(body["totals"]["payout"]), Decimal("148.50"))
+        self.assertEqual(Decimal(body["totals"]["earnings"]), Decimal("4.50"))
 
     def test_platform_fee_is_two_percent_rounded_to_paise(self):
         self.assertEqual(Order.platform_fee_for(Decimal("100")), Decimal("2.00"))

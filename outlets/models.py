@@ -335,6 +335,10 @@ class Order(models.Model):
     # every payment, so this alone does not quite cover it. checkout.js mirrors this
     # to show the total before the server confirms it — keep them in step.
     PLATFORM_FEE_RATE = Decimal("0.02")
+    # The platform's cut of the outlet's side: 1% of the food subtotal,
+    # taken off what the outlet is paid (see AdminReportView). Not stored
+    # per order, so changing it re-prices the whole report, past included.
+    RESTAURANT_COMMISSION_RATE = Decimal("0.01")
 
     @classmethod
     def platform_fee_for(cls, subtotal):
