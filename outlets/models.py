@@ -1,6 +1,6 @@
 import secrets
 import string
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -328,8 +328,18 @@ class Order(models.Model):
     # wherever an owner sees "how much do I owe/get for this order" —
     # they never see the fee itself, since it's not theirs.
     # Stored per-order (not looked up from a live constant) so a change to
-    # PLATFORM_FEE later doesn't retroactively alter historical orders.
-    PLATFORM_FEE = Decimal("1.50")
+    # the fee rate later doesn't retroactively alter historical orders.
+    #
+    # 1% of the food subtotal, rounded to the nearest paisa. Was a flat
+    # Rs 1.50; a percentage scales with the order. checkout.js mirrors this
+    # to show the total before the server confirms it — keep them in step.
+    PLATFORM_FEE_RATE = Decimal("0.01")
+
+    @classmethod
+    def platform_fee_for(cls, subtotal):
+        return (Decimal(subtotal) * cls.PLATFORM_FEE_RATE).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
     total_amount = models.DecimalField(max_digits=8, decimal_places=2)
     platform_fee = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
     estimated_ready_minutes = models.PositiveIntegerField(default=12)

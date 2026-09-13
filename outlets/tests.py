@@ -50,7 +50,7 @@ class UnansweredOrderSweepTests(TestCase):
     def paid_order(self, outlet, paid_minutes_ago, status=Order.STATUS_PLACED, total="26.50"):
         order = Order.objects.create(
             restaurant=outlet, student=self.student, student_name="stud",
-            total_amount=Decimal(total), platform_fee=Order.PLATFORM_FEE,
+            total_amount=Decimal(total), platform_fee=Decimal("1.50"),
             status=status, payment_status=Order.PAYMENT_PAID, razorpay_payment_id="pay_x",
         )
         paid_at = timezone.now() - timedelta(minutes=paid_minutes_ago)
@@ -121,6 +121,12 @@ class UnansweredOrderSweepTests(TestCase):
         self.assertEqual(Decimal(outlet["payout"]), Decimal("150.00"))
         self.assertEqual(outlet["upi_id"], "a@upi")
         self.assertEqual(Decimal(body["totals"]["payout"]), Decimal("150.00"))
+
+    def test_platform_fee_is_one_percent_rounded_to_paise(self):
+        self.assertEqual(Order.platform_fee_for(Decimal("100")), Decimal("1.00"))
+        self.assertEqual(Order.platform_fee_for(Decimal("26.50")), Decimal("0.27"))
+        self.assertEqual(Order.platform_fee_for(Decimal("12.25")), Decimal("0.12"))
+        self.assertEqual(Order.platform_fee_for(Decimal("0")), Decimal("0.00"))
 
     def test_partial_upi_patch_does_not_wipe_it(self):
         self.client.force_authenticate(self.owner_a)

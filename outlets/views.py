@@ -1115,13 +1115,14 @@ class CreateOrderView(APIView):
         # total_amount is what's actually charged (subtotal + platform fee)
         # — the restaurant's own payout is total_amount - platform_fee,
         # computed wherever an owner needs to see it (see OwnerOrderSerializer).
+        platform_fee = Order.platform_fee_for(subtotal)
         order = create_order_with_unique_code(
             restaurant=restaurant,
             student=request.user,
             student_name=student_name,
             special_instructions=special_instructions,
-            total_amount=subtotal + Order.PLATFORM_FEE,
-            platform_fee=Order.PLATFORM_FEE,
+            total_amount=subtotal + platform_fee,
+            platform_fee=platform_fee,
             scheduled_for=scheduled_for,
         )
         for item in pending_items:
