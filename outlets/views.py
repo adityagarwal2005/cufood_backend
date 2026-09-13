@@ -156,8 +156,26 @@ def send_owner_push(restaurant, title, body):
     )
 
 
+# The Razorpay SDK makes its HTTP calls with no timeout at all. A hung
+# connection would then hold its thread until gunicorn's 60s worker timeout
+# kills the whole worker, taking every other in-flight request down with
+# it. Since the refund sweep now rides on dashboard polls, that is a real
+# path rather than a theoretical one.
+RAZORPAY_TIMEOUT_SECONDS = 15
+
+
+class _RazorpayTimeoutSession(requests.Session):
+    def request(self, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = RAZORPAY_TIMEOUT_SECONDS
+        return super().request(*args, **kwargs)
+
+
 def get_razorpay_client():
-    return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+    return razorpay.Client(
+        session=_RazorpayTimeoutSession(),
+        auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
+    )
 
 
 def rupees_to_paise(amount):
@@ -789,6 +807,18 @@ class StudentOrdersView(APIView):
         # micro-optimisation: both serializers read order.restaurant and
         # order.items per row, so without them this is 1 + 2N queries —
         # ~201 for a full page. active-orders.js polls this every 30s.
+        #
+        # That polling also makes this a good place to enforce the outlet's
+        # deadline: a student who paid and went back to the home page is
+        # still waiting on exactly these orders.
+        auto_decline_unanswered_orders(list(
+            Order.objects.filter(
+                student=request.user,
+                status=Order.STATUS_PLACED,
+                payment_status=Order.PAYMENT_PAID,
+            ).select_related("restaurant")
+        ))
+        sweep_all_unanswered_orders()
         orders = (
             Order.objects.filter(
                 student=request.user,
@@ -1483,6 +1513,7 @@ class MyOrdersView(APIView):
                 .prefetch_related("items")
                 .order_by("-created_at")[:100]
             )
+        sweep_all_unanswered_orders()
         return Response(OwnerOrderSerializer(orders, many=True).data)
 
 
@@ -1610,6 +1641,21 @@ class AdminStatsView(APIView):
         today_start, today_end = day_bounds(target_date)
         yesterday_start, yesterday_end = day_bounds(target_date - timedelta(days=1))
 
+        # Anything still overdue straight after a forced sweep is an order
+        # whose refund is failing — almost always the Razorpay balance. A
+        # student is owed that money, so it is listed rather than buried in
+        # a log line.
+        sweep_all_unanswered_orders(force=True)
+        stuck_refunds = [
+            {
+                "order_code": o.order_code,
+                "restaurant_name": o.restaurant.name,
+                "total_amount": o.total_amount,
+                "paid_at": o.payment_confirmed_at or o.created_at,
+            }
+            for o in overdue_unanswered_orders().select_related("restaurant").order_by("created_at")[:50]
+        ]
+
         paid_orders = Order.objects.filter(payment_status=Order.PAYMENT_PAID)
         refunded_orders = Order.objects.filter(payment_status=Order.PAYMENT_REFUNDED)
 
@@ -1664,6 +1710,7 @@ class AdminStatsView(APIView):
             },
             "by_restaurant": by_restaurant,
             "by_location": by_location,
+            "stuck_refunds": stuck_refunds,
         })
 
 
@@ -1730,11 +1777,12 @@ class AdminReportView(APIView):
 
         buckets = {}
 
-        def bucket(restaurant_id, name, location):
+        def bucket(restaurant_id, name, location, upi_id):
             return buckets.setdefault(restaurant_id, {
                 "restaurant_id": restaurant_id,
                 "restaurant_name": name,
                 "location_name": location or "",
+                "upi_id": upi_id or "",
                 "successful_orders": 0,
                 "picked_up": 0,
                 "total_sales": Decimal("0.00"),
@@ -1748,7 +1796,8 @@ class AdminReportView(APIView):
         accepted = (
             in_range.filter(payment_status=Order.PAYMENT_PAID, status__in=self.ACCEPTED_STATUSES)
             .annotate(day=TruncDate("created_at", tzinfo=IST))
-            .values("restaurant_id", "restaurant__name", "restaurant__location__name", "day")
+            .values("restaurant_id", "restaurant__name", "restaurant__location__name",
+                    "restaurant__upi_id", "day")
             .annotate(
                 orders=Count("id"),
                 sales=Sum("total_amount"),
@@ -1757,7 +1806,8 @@ class AdminReportView(APIView):
             )
         )
         for row in accepted:
-            b = bucket(row["restaurant_id"], row["restaurant__name"], row["restaurant__location__name"])
+            b = bucket(row["restaurant_id"], row["restaurant__name"],
+                       row["restaurant__location__name"], row["restaurant__upi_id"])
             b["successful_orders"] += row["orders"]
             b["picked_up"] += row["completed"]
             b["total_sales"] += row["sales"] or Decimal("0.00")
@@ -1775,11 +1825,13 @@ class AdminReportView(APIView):
                 Q(status=Order.STATUS_REJECTED)
                 | Q(payment_status=Order.PAYMENT_PAID, status=Order.STATUS_PLACED)
             )
-            .values("restaurant_id", "restaurant__name", "restaurant__location__name", "status")
+            .values("restaurant_id", "restaurant__name", "restaurant__location__name",
+                    "restaurant__upi_id", "status")
             .annotate(orders=Count("id"), refunded=Sum("total_amount"))
         )
         for row in others:
-            b = bucket(row["restaurant_id"], row["restaurant__name"], row["restaurant__location__name"])
+            b = bucket(row["restaurant_id"], row["restaurant__name"],
+                       row["restaurant__location__name"], row["restaurant__upi_id"])
             if row["status"] == Order.STATUS_REJECTED:
                 b["rejected_orders"] += row["orders"]
                 b["refunded_amount"] += row["refunded"] or Decimal("0.00")
@@ -1817,6 +1869,10 @@ class AdminReportView(APIView):
                 day["items"] = sorted(day["items"].values(), key=lambda i: -i["quantity"])
                 days.append(day)
             b["days"] = days
+            # What to send the outlet: everything the students paid for
+            # their accepted orders, less the platform fee. Refunded and
+            # undecided orders are already excluded from total_sales.
+            b["payout"] = b["total_sales"] - b["platform_revenue"]
             restaurants.append(b)
         restaurants.sort(key=lambda r: (-r["total_sales"], r["restaurant_name"]))
 
@@ -1831,6 +1887,7 @@ class AdminReportView(APIView):
                 "rejected_orders": sum(r["rejected_orders"] for r in restaurants),
                 "refunded_amount": sum((r["refunded_amount"] for r in restaurants), Decimal("0.00")),
                 "awaiting_decision": sum(r["awaiting_decision"] for r in restaurants),
+                "payout": sum((r["payout"] for r in restaurants), Decimal("0.00")),
             },
             "restaurants": restaurants,
         })
@@ -2023,6 +2080,63 @@ def auto_decline_unanswered_orders(orders):
         )
         send_order_rejected_email(order, refunded=True)
     return declined
+
+
+# How often any one worker process runs the platform-wide sweep below, and
+# how many orders one pass may try to refund.
+GLOBAL_SWEEP_INTERVAL_SECONDS = 20
+GLOBAL_SWEEP_BATCH = 5
+_last_global_sweep = 0.0
+
+
+def overdue_unanswered_orders():
+    """Paid orders nobody answered whose decision window has closed."""
+    cutoff = timezone.now() - timedelta(minutes=Order.DECISION_WINDOW_MINUTES)
+    return Order.objects.filter(
+        status=Order.STATUS_PLACED, payment_status=Order.PAYMENT_PAID,
+    ).filter(
+        Q(payment_confirmed_at__lte=cutoff)
+        | Q(payment_confirmed_at__isnull=True, created_at__lte=cutoff)
+    )
+
+
+def sweep_all_unanswered_orders(force=False):
+    """Run auto_decline_unanswered_orders across every outlet, not only the
+    one whose dashboard happens to be open.
+
+    The per-outlet sweep in MyOrdersView only fires while THAT outlet's
+    dashboard is polling. An outlet that closes the tab, loses signal, or
+    never opens the dashboard that day would otherwise hold a student's
+    money indefinitely, because nothing else ever looks at those orders.
+    With a dozen outlets live, some dashboard or student page is almost
+    always polling, so riding along on those polls covers everyone without
+    a scheduler.
+
+    Rate-limited per process, so a dozen dashboards polling every few
+    seconds cost one small query every GLOBAL_SWEEP_INTERVAL_SECONDS rather
+    than hundreds a minute. Two threads racing past the check is harmless:
+    the claim inside auto_decline_unanswered_orders keeps each refund
+    single-shot. The batch cap bounds how long a poll can be held up when
+    refunds are failing (e.g. an empty Razorpay balance); oldest-attempted
+    first, so nothing starves.
+
+    Never raises — it rides on read endpoints, and a sweep problem must not
+    break the page that triggered it."""
+    global _last_global_sweep
+    now_mono = monotonic()
+    if not force and now_mono - _last_global_sweep < GLOBAL_SWEEP_INTERVAL_SECONDS:
+        return
+    _last_global_sweep = now_mono
+    try:
+        batch = list(
+            overdue_unanswered_orders()
+            .select_related("restaurant")
+            .order_by("updated_at")[:GLOBAL_SWEEP_BATCH]
+        )
+        if batch:
+            auto_decline_unanswered_orders(batch)
+    except Exception:
+        logger.exception("Platform-wide unanswered-order sweep failed")
 
 
 class RejectOrderView(APIView):
