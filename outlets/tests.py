@@ -122,10 +122,10 @@ class UnansweredOrderSweepTests(TestCase):
         self.assertEqual(outlet["upi_id"], "a@upi")
         self.assertEqual(Decimal(body["totals"]["payout"]), Decimal("150.00"))
 
-    def test_platform_fee_is_one_percent_rounded_to_paise(self):
-        self.assertEqual(Order.platform_fee_for(Decimal("100")), Decimal("1.00"))
-        self.assertEqual(Order.platform_fee_for(Decimal("26.50")), Decimal("0.27"))
-        self.assertEqual(Order.platform_fee_for(Decimal("12.25")), Decimal("0.12"))
+    def test_platform_fee_is_two_percent_rounded_to_paise(self):
+        self.assertEqual(Order.platform_fee_for(Decimal("100")), Decimal("2.00"))
+        self.assertEqual(Order.platform_fee_for(Decimal("26.50")), Decimal("0.53"))
+        self.assertEqual(Order.platform_fee_for(Decimal("12.25")), Decimal("0.25"))
         self.assertEqual(Order.platform_fee_for(Decimal("0")), Decimal("0.00"))
 
     def test_partial_upi_patch_does_not_wipe_it(self):

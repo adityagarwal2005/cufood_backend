@@ -330,10 +330,11 @@ class Order(models.Model):
     # Stored per-order (not looked up from a live constant) so a change to
     # the fee rate later doesn't retroactively alter historical orders.
     #
-    # 1% of the food subtotal, rounded to the nearest paisa. Was a flat
-    # Rs 1.50; a percentage scales with the order. checkout.js mirrors this
+    # 2% of the food subtotal, rounded to the nearest paisa. Was a flat
+    # Rs 1.50; a percentage scales with the order. Razorpay keeps ~2.36% of
+    # every payment, so this alone does not quite cover it. checkout.js mirrors this
     # to show the total before the server confirms it — keep them in step.
-    PLATFORM_FEE_RATE = Decimal("0.01")
+    PLATFORM_FEE_RATE = Decimal("0.02")
 
     @classmethod
     def platform_fee_for(cls, subtotal):
