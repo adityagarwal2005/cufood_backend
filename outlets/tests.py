@@ -372,3 +372,14 @@ class UnlistedOutletTests(TestCase):
         names = [r["restaurant_name"] for r in self.client.get("/api/admin/stats/").json()["outlet_alerts"]]
         self.assertIn("Listed Outlet", names)
         self.assertNotIn("Hidden Outlet", names)
+
+
+class LocationOrderTests(TestCase):
+    def test_locations_are_listed_in_the_order_they_were_added(self):
+        # Migrations already create the real blocks, so add fresh ones whose
+        # alphabetical order is the reverse of the order they were added.
+        for name in ("Zeta Block", "Mid Block", "Alpha Block"):
+            Location.objects.create(name=name)
+        names = [loc["name"] for loc in APIClient().get("/api/locations/").json()]
+        added = [n for n in names if n.endswith(" Block")]
+        self.assertEqual(added, ["Zeta Block", "Mid Block", "Alpha Block"])

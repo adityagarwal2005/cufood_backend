@@ -308,7 +308,10 @@ def get_valid_location_or_error(request):
 
 
 class LocationListView(ListAPIView):
-    queryset = Location.objects.all().order_by("name")
+    # In the order they were added, not alphabetically: blocks are shown as
+    # campus knows them (Food Republic, Pentagon, then newer ones like D7),
+    # and alphabetical order would put a newly added "D7" first.
+    queryset = Location.objects.all().order_by("id")
     serializer_class = LocationSerializer
 
 
