@@ -319,7 +319,7 @@ class RestaurantListView(ListAPIView):
         location_slug, error = get_valid_location_or_error(self.request)
         if error is not None:
             return Restaurant.objects.none()
-        return Restaurant.objects.filter(location__slug=location_slug).order_by("name")
+        return Restaurant.objects.filter(location__slug=location_slug, is_listed=True).order_by("name")
 
     def list(self, request, *args, **kwargs):
         _, error = get_valid_location_or_error(request)
@@ -332,7 +332,7 @@ class RestaurantDetailView(RetrieveAPIView):
     # select_related("location") folds what would otherwise be a second
     # query (for RestaurantDetailSerializer.location) into the same query
     # via a SQL JOIN — one less round-trip on the page a student hits most.
-    queryset = Restaurant.objects.select_related("location")
+    queryset = Restaurant.objects.filter(is_listed=True).select_related("location")
     serializer_class = RestaurantDetailSerializer
     lookup_field = "slug"
 
@@ -351,6 +351,7 @@ class SearchView(APIView):
             is_permanently_active=True,
             is_available_today=True,
             restaurant__location__slug=location_slug,
+            restaurant__is_listed=True,
         ).filter(Q(name__icontains=query) | Q(category__icontains=query))
 
         counts = {}
@@ -1096,7 +1097,7 @@ class CreateOrderView(APIView):
         if schedule_error:
             return Response({"detail": schedule_error}, status=status.HTTP_400_BAD_REQUEST)
 
-        restaurant = get_object_or_404(Restaurant, slug=restaurant_slug)
+        restaurant = get_object_or_404(Restaurant, slug=restaurant_slug, is_listed=True)
 
         # Every outlet on campus runs the same real-world hours — this is a
         # campus-wide rule, not a per-restaurant setting, so it's checked
@@ -1811,7 +1812,7 @@ class AdminStatsView(APIView):
             # declined and refunded.
             "outlet_alerts": [
                 {"restaurant_name": r.name, "devices": r.devices}
-                for r in Restaurant.objects.annotate(devices=Count("push_subscriptions"))
+                for r in Restaurant.objects.filter(is_listed=True).annotate(devices=Count("push_subscriptions"))
                 .order_by("devices", "name")
             ],
         })

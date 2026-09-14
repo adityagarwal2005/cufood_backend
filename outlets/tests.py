@@ -330,3 +330,45 @@ class StudentAccountPushTests(TestCase):
         resp = self.client.post(f"/api/orders/{order.order_code}/subscribe/",
                                 {"endpoint": "https://fcm.googleapis.com/x", "keys": "oops"}, format="json")
         self.assertEqual(resp.status_code, 400)
+
+
+class UnlistedOutletTests(TestCase):
+    """An outlet that isn't a partner is hidden everywhere a student could
+    find or order from it, without deleting it."""
+
+    def setUp(self):
+        self.location = Location.objects.create(name="Food Republic Test")
+        self.listed = Restaurant.objects.create(name="Listed Outlet", location=self.location)
+        self.hidden = Restaurant.objects.create(name="Hidden Outlet", location=self.location, is_listed=False)
+        for outlet in (self.listed, self.hidden):
+            outlet.menu_items.create(name="Masala Chai", category="Tea", price=Decimal("20.00"))
+        self.client = APIClient()
+
+    def test_hidden_outlet_is_not_listed_or_counted(self):
+        names = [r["name"] for r in self.client.get(f"/api/restaurants/?location={self.location.slug}").json()]
+        self.assertEqual(names, ["Listed Outlet"])
+
+    def test_hidden_outlet_page_is_not_found(self):
+        self.assertEqual(self.client.get(f"/api/restaurants/{self.listed.slug}/").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/restaurants/{self.hidden.slug}/").status_code, 404)
+
+    def test_hidden_outlet_is_not_in_search(self):
+        results = self.client.get(f"/api/search/?location={self.location.slug}&q=chai").json()
+        self.assertEqual([r["restaurant_name"] for r in results], ["Listed Outlet"])
+
+    def test_hidden_outlet_cannot_take_an_order(self):
+        student = User.objects.create_user("hidden_outlet_stud", password="x")
+        StudentProfile.objects.create(user=student)
+        self.client.force_authenticate(student)
+        resp = self.client.post("/api/orders/create/", {
+            "restaurant_slug": self.hidden.slug,
+            "items": [{"menu_item_id": self.hidden.menu_items.first().id, "quantity": 1}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_hidden_outlet_is_left_out_of_admin_alerts(self):
+        admin = User.objects.create_superuser("hidden_outlet_root", password="x")
+        self.client.force_authenticate(admin)
+        names = [r["restaurant_name"] for r in self.client.get("/api/admin/stats/").json()["outlet_alerts"]]
+        self.assertIn("Listed Outlet", names)
+        self.assertNotIn("Hidden Outlet", names)

@@ -92,6 +92,13 @@ class Restaurant(models.Model):
     # for a specific restaurant during onboarding/testing, then turned back
     # off once that restaurant is actually handed to its real owner.
     bypass_business_hours = models.BooleanField(default=False)
+    # Whether students can see and order from this outlet at all. Turned off
+    # for outlets that aren't (or are no longer) partners — rather than
+    # deleting them, which would take their menus and any order history
+    # with them, and would mean re-entering everything if they sign up
+    # later. Hidden outlets drop out of every listing, search, the outlet
+    # page itself, and order creation.
+    is_listed = models.BooleanField(default=True)
 
     def save(self, *args, **kwargs):
         if not self.slug:
