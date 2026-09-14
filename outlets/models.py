@@ -476,6 +476,27 @@ class PushSubscription(models.Model):
         return f"Push subscription for {self.order.order_code}"
 
 
+class StudentPushSubscription(models.Model):
+    """A student's phone, signed up once for updates on all of their orders.
+
+    PushSubscription above predates student accounts and hangs off a single
+    order, so a phone had to be signed up again for every order. In the
+    installed app, which almost every student uses, that sign-up runs just
+    as Razorpay takes over the screen and is usually cut off. Tied to the
+    account instead, one "Turn on" covers every order that follows."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="student_push_subscriptions"
+    )
+    endpoint = models.URLField(max_length=500, unique=True)
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Push subscription for {self.user}"
+
+
 class RestaurantPushSubscription(models.Model):
     """A restaurant owner's Web Push subscription — unlike PushSubscription
     above, this attaches to the restaurant/account itself (owners do log

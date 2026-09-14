@@ -26,7 +26,7 @@ from rest_framework.test import APIClient
 
 from . import views
 from .models import (Location, Order, PushSubscription, Restaurant,
-                     RestaurantPushSubscription, StudentProfile)
+                     RestaurantPushSubscription, StudentProfile, StudentPushSubscription)
 
 
 def fake_refund(order):
@@ -258,3 +258,75 @@ class PushDeliveryTests(TestCase):
         client.force_authenticate(self.admin)
         alerts = client.get("/api/admin/stats/").json()["outlet_alerts"]
         self.assertIn({"restaurant_name": "Push Outlet", "devices": 1}, alerts)
+
+
+@override_settings(VAPID_PRIVATE_KEY=TEST_VAPID_PEM, VAPID_CLAIM_EMAIL="mailto:test@example.com")
+class StudentAccountPushTests(TestCase):
+    """Students sign a phone up once, on their account, and hear about every
+    order after — which is what makes notifications work in the app, where
+    a per-order sign-up is cut off by the Razorpay redirect."""
+
+    URL = "/api/students/push/subscribe/"
+
+    def setUp(self):
+        views._vapid_signer = None
+        loc = Location.objects.create(name="Block S")
+        self.outlet = Restaurant.objects.create(name="S Outlet", location=loc)
+        self.student = User.objects.create_user("acct_stud", password="x")
+        StudentProfile.objects.create(user=self.student)
+        self.client = APIClient()
+
+    def tearDown(self):
+        views._vapid_signer = None
+
+    def order(self):
+        return Order.objects.create(restaurant=self.outlet, student=self.student, student_name="acct_stud",
+                                    total_amount=Decimal("51.00"), platform_fee=Decimal("1.00"))
+
+    def test_one_signup_covers_every_later_order(self):
+        key, auth, keys = browser_subscription()
+        self.client.force_authenticate(self.student)
+        body = {"endpoint": "https://fcm.googleapis.com/fcm/send/stud", "keys": keys}
+        self.assertEqual(self.client.post(self.URL, body, format="json").status_code, 201)
+        self.assertEqual(self.client.post(self.URL, body, format="json").status_code, 201)  # app reopened
+        self.assertEqual(StudentPushSubscription.objects.count(), 1)
+        for order in (self.order(), self.order()):
+            sent, capturing = capture_push_requests()
+            with capturing:
+                views.send_order_push(order, "Order accepted", "S Outlet is preparing your order.")
+            self.assertEqual(len(sent), 1)
+            payload = json.loads(http_ece.decrypt(sent[0]["data"], private_key=key, auth_secret=auth,
+                                                  version="aes128gcm"))
+            self.assertEqual(payload["tag"], f"order-{order.order_code}")
+
+    def test_phone_signed_up_both_ways_is_notified_once(self):
+        _k, _a, keys = browser_subscription()
+        endpoint = "https://fcm.googleapis.com/fcm/send/both"
+        order = self.order()
+        PushSubscription.objects.create(order=order, endpoint=endpoint, **keys)
+        StudentPushSubscription.objects.create(user=self.student, endpoint=endpoint, **keys)
+        sent, capturing = capture_push_requests()
+        with capturing:
+            views.send_order_push(order, "Ready for pickup!", "Go collect it.")
+        self.assertEqual(len(sent), 1)
+
+    def test_signup_needs_a_student_and_a_well_formed_subscription(self):
+        _k, _a, keys = browser_subscription()
+        good = {"endpoint": "https://fcm.googleapis.com/fcm/send/x", "keys": keys}
+        self.assertIn(self.client.post(self.URL, good, format="json").status_code, (401, 403))
+        self.client.force_authenticate(User.objects.create_user("owner_not_student", password="x"))
+        self.assertEqual(self.client.post(self.URL, good, format="json").status_code, 404)
+        self.client.force_authenticate(self.student)
+        for bad in ({"endpoint": "http://insecure.example", "keys": keys},
+                    {"endpoint": good["endpoint"], "keys": "not-an-object"},
+                    {"endpoint": "https://x.example/" + "a" * 600, "keys": keys},
+                    {"endpoint": good["endpoint"], "keys": {"p256dh": "", "auth": "x"}},
+                    {}):
+            self.assertEqual(self.client.post(self.URL, bad, format="json").status_code, 400, bad)
+        self.assertEqual(StudentPushSubscription.objects.count(), 0)
+
+    def test_order_link_signup_rejects_malformed_keys_instead_of_crashing(self):
+        order = self.order()
+        resp = self.client.post(f"/api/orders/{order.order_code}/subscribe/",
+                                {"endpoint": "https://fcm.googleapis.com/x", "keys": "oops"}, format="json")
+        self.assertEqual(resp.status_code, 400)

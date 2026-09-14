@@ -16,6 +16,7 @@ urlpatterns = [
     path("students/request-otp/", views.StudentRequestOtpView.as_view()),
     path("students/me/", views.StudentMeView.as_view()),
     path("students/orders/", views.StudentOrdersView.as_view()),
+    path("students/push/subscribe/", views.StudentPushSubscribeView.as_view()),
     path("me/restaurant/", views.MyRestaurantView.as_view()),
     path("me/restaurant/toggle-open/", views.ToggleRestaurantOpenView.as_view()),
     path("me/restaurant/upi-id/", views.UpdateUpiIdView.as_view()),

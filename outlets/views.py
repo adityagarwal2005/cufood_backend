@@ -45,6 +45,7 @@ from .models import (
     Restaurant,
     RestaurantPushSubscription,
     StudentProfile,
+    StudentPushSubscription,
     is_within_business_hours,
 )
 
@@ -176,11 +177,18 @@ def send_resend_email(payload):
 
 
 def send_order_push(order, title, body):
-    """A student's status page works fine over polling alone (see
-    order-status.js) — this is a bonus that fires a real system
-    notification even if they've closed the tab/app."""
+    """Tell the student about their order on every phone they have signed
+    up: those signed up on their account, plus any signed up on this one
+    order (the older flow). A phone on both lists is notified once.
+
+    An open status page still updates by polling without this; this is what
+    reaches a student whose app is closed."""
+    subscriptions = {sub.endpoint: sub for sub in order.push_subscriptions.all()}
+    if order.student_id:
+        for sub in StudentPushSubscription.objects.filter(user_id=order.student_id):
+            subscriptions.setdefault(sub.endpoint, sub)
     _send_webpush_to(
-        order.push_subscriptions.all(), title, body,
+        list(subscriptions.values()), title, body,
         f"/order-status.html?code={order.order_code}", f"order {order.order_code}",
         tag=f"order-{order.order_code}", kind="order_update", ttl=STUDENT_PUSH_TTL_SECONDS,
     )
@@ -1443,6 +1451,24 @@ class OrderStatusView(APIView):
         return Response(OrderSerializer(order).data)
 
 
+def parse_push_subscription(data):
+    """(endpoint, p256dh, auth) from a browser's PushSubscription JSON, or
+    None if it isn't one. Strict because it is stored and later sent to:
+    malformed input would otherwise surface as a 500 when it overflows a
+    column, or as a failed notification long after the request."""
+    if not isinstance(data, dict):
+        return None
+    endpoint, keys = data.get("endpoint"), data.get("keys")
+    if not isinstance(endpoint, str) or not isinstance(keys, dict):
+        return None
+    if not endpoint.startswith("https://") or len(endpoint) > 500:
+        return None
+    p256dh, auth = keys.get("p256dh"), keys.get("auth")
+    if not all(isinstance(k, str) and 0 < len(k) <= 255 for k in (p256dh, auth)):
+        return None
+    return endpoint, p256dh, auth
+
+
 class SubscribeOrderPushView(APIView):
     """Called from order-status.html once a student grants notification
     permission — stores their browser's Web Push subscription against this
@@ -1457,12 +1483,10 @@ class SubscribeOrderPushView(APIView):
 
     def post(self, request, order_code):
         order = get_object_or_404(Order, order_code=order_code.upper())
-        endpoint = request.data.get("endpoint")
-        keys = request.data.get("keys") or {}
-        p256dh = keys.get("p256dh")
-        auth = keys.get("auth")
-        if not endpoint or not p256dh or not auth:
+        parsed = parse_push_subscription(request.data)
+        if parsed is None:
             return Response({"detail": "Invalid subscription."}, status=status.HTTP_400_BAD_REQUEST)
+        endpoint, p256dh, auth = parsed
 
         PushSubscription.objects.update_or_create(
             endpoint=endpoint,
@@ -1488,16 +1512,38 @@ class SubscribeOwnerPushView(APIView):
                 {"detail": "No restaurant linked to this account"},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        endpoint = request.data.get("endpoint")
-        keys = request.data.get("keys") or {}
-        p256dh = keys.get("p256dh")
-        auth = keys.get("auth")
-        if not endpoint or not p256dh or not auth:
+        parsed = parse_push_subscription(request.data)
+        if parsed is None:
             return Response({"detail": "Invalid subscription."}, status=status.HTTP_400_BAD_REQUEST)
+        endpoint, p256dh, auth = parsed
 
         RestaurantPushSubscription.objects.update_or_create(
             endpoint=endpoint,
             defaults={"restaurant": restaurant, "p256dh": p256dh, "auth": auth},
+        )
+        return Response(status=status.HTTP_201_CREATED)
+
+
+class StudentPushSubscribeView(APIView):
+    """Signs a student's phone up for updates on all of their orders (see
+    StudentPushSubscription). The app calls this on every open once
+    notifications are allowed, so a subscription the browser rotates is
+    picked up without the student noticing. Keyed on the endpoint, so it is
+    idempotent and moves a shared phone to whoever is signed in now."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not hasattr(request.user, "student_profile"):
+            return Response({"detail": "Not a student account."}, status=status.HTTP_404_NOT_FOUND)
+        parsed = parse_push_subscription(request.data)
+        if parsed is None:
+            return Response({"detail": "Invalid subscription."}, status=status.HTTP_400_BAD_REQUEST)
+        endpoint, p256dh, auth = parsed
+
+        StudentPushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={"user": request.user, "p256dh": p256dh, "auth": auth},
         )
         return Response(status=status.HTTP_201_CREATED)
 
