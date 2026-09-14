@@ -23,6 +23,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.utils.html import escape
+from py_vapid import Vapid
 from pywebpush import WebPushException, webpush
 from rest_framework import status
 from rest_framework.authtoken.models import Token
@@ -50,14 +51,41 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
-def _send_webpush_to(subscriptions, title, body, url, context_label):
+_vapid_signer = None
+
+
+def get_vapid_signer():
+    """Parse the VAPID private key once, in whatever format it is stored.
+
+    pywebpush's own parsing (Vapid.from_string) only understands a raw or
+    DER key. Ours is stored as PEM, so every send raised "Could not
+    deserialize key data" before anything left the server — not one
+    notification had ever been delivered to a student or an owner. Parsing
+    the PEM here and handing pywebpush the ready signer fixes it without
+    rotating the key, which would have invalidated every subscription."""
+    global _vapid_signer
+    if _vapid_signer is None:
+        key = settings.VAPID_PRIVATE_KEY.strip()
+        _vapid_signer = (
+            Vapid.from_pem(key.encode()) if key.startswith("-----BEGIN")
+            else Vapid.from_string(private_key=key)
+        )
+    return _vapid_signer
+
+
+def _send_webpush_to(subscriptions, title, body, url, context_label, *, tag, kind, ttl):
     """Shared send loop for both push flows below — the only difference
     between a student's per-order subscription and an owner's per-restaurant
     one is what they're stored against, not how sending/cleanup works.
     Best-effort: failures here should never break the status transition
     that triggered them, so every exception is swallowed after logging.
-    A 410 Gone means the browser/OS revoked that subscription (uninstalled,
-    permission revoked, etc.) — deleting it rather than retrying it forever."""
+    A 404/410 means the browser/OS revoked that subscription (uninstalled,
+    permission revoked, etc.) — deleting it rather than retrying it forever.
+
+    Urgency "high" is what gets a push through to a phone that is asleep:
+    Android holds normal-priority messages back while the device dozes,
+    which for an outlet with three minutes to accept is the same as never
+    sending it."""
     if not settings.VAPID_PRIVATE_KEY:
         return
     deadline = monotonic() + PUSH_TOTAL_BUDGET_SECONDS
@@ -69,20 +97,25 @@ def _send_webpush_to(subscriptions, title, body, url, context_label):
             logger.warning("Push budget exhausted for %s; skipping remaining", context_label)
             return
         try:
-            webpush(
+            response = webpush(
                 subscription_info={
                     "endpoint": sub.endpoint,
                     "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
                 },
-                data=json.dumps({"title": title, "body": body, "url": url}),
-                vapid_private_key=settings.VAPID_PRIVATE_KEY,
+                data=json.dumps({"title": title, "body": body, "url": url, "tag": tag, "kind": kind}),
+                vapid_private_key=get_vapid_signer(),
                 vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
                 timeout=PUSH_TIMEOUT_SECONDS,
+                ttl=ttl,
+                headers={"Urgency": "high"},
             )
+            logger.info("Push sent for %s (%s): HTTP %s", context_label, kind,
+                        getattr(response, "status_code", "?"))
         except WebPushException as err:
             status_code = getattr(err.response, "status_code", None)
-            if status_code == 410:
+            if status_code in (404, 410):
                 sub.delete()
+                logger.info("Removed expired push subscription for %s", context_label)
             else:
                 logger.warning("Push failed for %s: %s", context_label, err)
         except Exception:
@@ -107,6 +140,14 @@ PUSH_TIMEOUT_SECONDS = 5
 # Ceiling across ALL of one recipient's subscriptions, since the loop below
 # is sequential and a device can hold several.
 PUSH_TOTAL_BUDGET_SECONDS = 12
+# How long a push service may hold a notification for a phone that is
+# asleep or offline before giving up. pywebpush defaults to 0, meaning
+# "deliver this instant or drop it", so a locked phone or a closed app could
+# simply never get it. An outlet's alert is worthless once its three-minute
+# window has closed; a student's order update stays useful for about as
+# long as the food does.
+OWNER_PUSH_TTL_SECONDS = 300
+STUDENT_PUSH_TTL_SECONDS = 3600
 
 
 def send_resend_email(payload):
@@ -141,10 +182,11 @@ def send_order_push(order, title, body):
     _send_webpush_to(
         order.push_subscriptions.all(), title, body,
         f"/order-status.html?code={order.order_code}", f"order {order.order_code}",
+        tag=f"order-{order.order_code}", kind="order_update", ttl=STUDENT_PUSH_TTL_SECONDS,
     )
 
 
-def send_owner_push(restaurant, title, body):
+def send_owner_push(restaurant, title, body, tag):
     """Fired the instant a new order's payment is confirmed (see
     RazorpayWebhookView) — that's the same moment it first becomes
     visible/actionable on the dashboard (see MyOrdersView), so a real
@@ -153,6 +195,7 @@ def send_owner_push(restaurant, title, body):
     _send_webpush_to(
         restaurant.push_subscriptions.all(), title, body,
         "/dashboard.html", f"restaurant {restaurant.slug}",
+        tag=tag, kind="new_order", ttl=OWNER_PUSH_TTL_SECONDS,
     )
 
 
@@ -1226,9 +1269,13 @@ def mark_order_paid(order, razorpay_payment_id):
 
     order.refresh_from_db()
     item_summary = ", ".join(f"{item.quantity}x {item.name}" for item in order.items.all())
+    # The outlet's share, not what the student paid: owners never see the
+    # platform fee anywhere else either.
     send_owner_push(
         order.restaurant, "New order!",
-        f"{item_summary} — ₹{order.total_amount}",
+        f"{item_summary} — ₹{order.total_amount - order.platform_fee}. "
+        f"Accept within {Order.DECISION_WINDOW_MINUTES} minutes.",
+        tag=f"new-{order.order_code}",
     )
     send_order_confirmation_email(order)
     return True
@@ -1712,6 +1759,15 @@ class AdminStatsView(APIView):
             "by_restaurant": by_restaurant,
             "by_location": by_location,
             "stuck_refunds": stuck_refunds,
+            # Devices signed up for new-order alerts, per outlet. An outlet
+            # at zero only finds out about orders by staring at the
+            # dashboard, and anything it misses for three minutes is
+            # declined and refunded.
+            "outlet_alerts": [
+                {"restaurant_name": r.name, "devices": r.devices}
+                for r in Restaurant.objects.annotate(devices=Count("push_subscriptions"))
+                .order_by("devices", "name")
+            ],
         })
 
 

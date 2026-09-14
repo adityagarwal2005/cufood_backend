@@ -8,17 +8,25 @@ Every Razorpay call is patched out. That is only safe because the test
 runner builds its own empty database — the same patch pointed at the
 production database once marked a real order refunded when no money moved.
 """
+import base64
+import json
+import os
 from datetime import timedelta
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import http_ece
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from . import views
-from .models import Location, Order, Restaurant, StudentProfile
+from .models import (Location, Order, PushSubscription, Restaurant,
+                     RestaurantPushSubscription, StudentProfile)
 
 
 def fake_refund(order):
@@ -139,3 +147,114 @@ class UnansweredOrderSweepTests(TestCase):
         self.assertEqual(self.client.patch("/api/me/restaurant/upi-id/", {}, format="json").status_code, 400)
         self.outlet_a.refresh_from_db()
         self.assertEqual(self.outlet_a.upi_id, "a@upi")
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+# A throwaway VAPID key, in the same PEM form production stores its key in —
+# which is exactly the format that used to make every send fail.
+TEST_VAPID_PEM = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+    serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+).decode()
+
+
+def browser_subscription():
+    """What a browser hands the site when it subscribes: its public key and
+    auth secret. The private half is kept so the test can decrypt the push
+    exactly as the phone would."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    public = key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+    auth = os.urandom(16)
+    return key, auth, {"p256dh": b64url(public), "auth": b64url(auth)}
+
+
+def capture_push_requests(status_code=201):
+    sent = []
+
+    def fake_post(url, data=None, headers=None, timeout=None, **kwargs):
+        sent.append({"url": url, "data": data, "headers": {k.lower(): v for k, v in (headers or {}).items()},
+                     "timeout": timeout})
+        return MagicMock(status_code=status_code, text="", headers={})
+
+    return sent, patch("requests.post", fake_post)
+
+
+@override_settings(VAPID_PRIVATE_KEY=TEST_VAPID_PEM, VAPID_CLAIM_EMAIL="mailto:test@example.com")
+@patch("outlets.views.send_order_confirmation_email", lambda *a, **k: None)
+class PushDeliveryTests(TestCase):
+    def setUp(self):
+        views._vapid_signer = None
+        loc = Location.objects.create(name="Block P")
+        self.owner = User.objects.create_user("push_owner", password="x")
+        self.outlet = Restaurant.objects.create(name="Push Outlet", location=loc, owner=self.owner)
+        self.student = User.objects.create_user("push_stud", password="x")
+        self.admin = User.objects.create_superuser("push_root", password="x")
+
+    def tearDown(self):
+        views._vapid_signer = None
+
+    def new_order(self):
+        return Order.objects.create(
+            restaurant=self.outlet, student=self.student, student_name="push_stud",
+            total_amount=Decimal("102.00"), platform_fee=Decimal("2.00"), razorpay_order_id="order_x",
+        )
+
+    def test_paid_order_alerts_owner_in_a_form_their_phone_can_decrypt(self):
+        key, auth, keys = browser_subscription()
+        RestaurantPushSubscription.objects.create(
+            restaurant=self.outlet, endpoint="https://fcm.googleapis.com/fcm/send/owner", **keys)
+        order = self.new_order()
+        sent, capturing = capture_push_requests()
+        with capturing:
+            self.assertTrue(views.mark_order_paid(order, "pay_1"))
+
+        self.assertEqual(len(sent), 1)
+        headers = sent[0]["headers"]
+        self.assertEqual(str(headers["ttl"]), str(views.OWNER_PUSH_TTL_SECONDS))
+        self.assertEqual(headers["urgency"], "high")
+        self.assertTrue(headers["authorization"].startswith("vapid "))
+        self.assertEqual(headers["content-encoding"], "aes128gcm")
+        payload = json.loads(http_ece.decrypt(sent[0]["data"], private_key=key, auth_secret=auth,
+                                              version="aes128gcm"))
+        self.assertEqual(payload["title"], "New order!")
+        self.assertEqual(payload["kind"], "new_order")
+        self.assertEqual(payload["tag"], f"new-{order.order_code}")
+        self.assertIn("₹100.00", payload["body"])  # the outlet's share, not the student's total
+
+    def test_student_update_is_held_for_a_sleeping_phone(self):
+        key, auth, keys = browser_subscription()
+        order = self.new_order()
+        PushSubscription.objects.create(order=order, endpoint="https://web.push.apple.com/stud", **keys)
+        sent, capturing = capture_push_requests()
+        with capturing:
+            views.send_order_push(order, "Order accepted", "Push Outlet is preparing your order.")
+        headers = sent[0]["headers"]
+        self.assertEqual(str(headers["ttl"]), str(views.STUDENT_PUSH_TTL_SECONDS))
+        self.assertEqual(headers["urgency"], "high")
+        payload = json.loads(http_ece.decrypt(sent[0]["data"], private_key=key, auth_secret=auth,
+                                              version="aes128gcm"))
+        self.assertEqual(payload["title"], "Order accepted")
+        self.assertEqual(payload["url"], f"/order-status.html?code={order.order_code}")
+
+    def test_revoked_subscriptions_are_cleaned_up(self):
+        for code in (404, 410):
+            _k, _a, keys = browser_subscription()
+            RestaurantPushSubscription.objects.create(
+                restaurant=self.outlet, endpoint=f"https://fcm.googleapis.com/fcm/send/{code}", **keys)
+            sent, capturing = capture_push_requests(status_code=code)
+            with capturing:
+                views.send_owner_push(self.outlet, "New order!", "x", tag="t")
+            self.assertEqual(RestaurantPushSubscription.objects.count(), 0)
+
+    def test_admin_sees_which_outlets_have_alerts_on(self):
+        _k, _a, keys = browser_subscription()
+        RestaurantPushSubscription.objects.create(
+            restaurant=self.outlet, endpoint="https://fcm.googleapis.com/fcm/send/a", **keys)
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        alerts = client.get("/api/admin/stats/").json()["outlet_alerts"]
+        self.assertIn({"restaurant_name": "Push Outlet", "devices": 1}, alerts)

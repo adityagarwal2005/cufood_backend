@@ -10,3 +10,4 @@ requests==2.34.2
 sqlparse==0.5.5
 gunicorn==23.0.0
 whitenoise==6.11.0
+py-vapid==1.9.4

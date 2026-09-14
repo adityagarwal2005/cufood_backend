@@ -130,6 +130,17 @@ DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = env.bool(
 )
 
 
+# Without this, Python drops anything below WARNING from the app's own
+# loggers, so the only push activity that ever reached Cloud Run's logs was
+# failures — there was no way to confirm a notification had gone out.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"outlets": {"handlers": ["console"], "level": "INFO", "propagate": False}},
+}
+
+
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
 
